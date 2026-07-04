@@ -23,11 +23,12 @@ const PROXY_PREFIX = "/api/comments";
 // the bot won't post to arbitrary repos even if someone crafts a request.
 // Every new creator repo goes here; content_slug is stable per repo.
 const REPO_ALLOWLIST: Record<string, { owner: string; repo: string }> = {
-  "secret-life-of-ai":       { owner: "Binary-Blender", repo: "secret-life-of-ai" },
-  "vela-works":              { owner: "Binary-Blender", repo: "vela-works" },
-  "soren-vael-works":        { owner: "Binary-Blender", repo: "soren-vael-works" },
-  "aiwinwin-books":          { owner: "Binary-Blender", repo: "aiwinwin-books" },
-  "algorithmic-arts-books":  { owner: "Binary-Blender", repo: "algorithmic-arts-books" },
+  "secret-life-of-ai":            { owner: "Binary-Blender", repo: "secret-life-of-ai" },
+  "vela-works":                   { owner: "Binary-Blender", repo: "vela-works" },
+  "soren-vael-works":             { owner: "Binary-Blender", repo: "soren-vael-works" },
+  "aiwinwin-books":               { owner: "Binary-Blender", repo: "aiwinwin-books" },
+  "algorithmic-arts-books":       { owner: "Binary-Blender", repo: "algorithmic-arts-books" },
+  "algorithmic-arts-community":   { owner: "Binary-Blender", repo: "algorithmic-arts-community" },
 };
 
 const ALLOWED_ORIGINS = new Set([
