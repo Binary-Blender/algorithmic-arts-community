@@ -21,6 +21,15 @@ interface Env {
 
 const COMMENTS_PREFIX = "/api/comments";
 const LIKES_PREFIX    = "/api/likes";
+const REGISTER_PREFIX = "/api/register";
+
+const INDEX_REPO_OWNER = "Binary-Blender";
+const INDEX_REPO_NAME  = "algorithmic-arts-index";
+const INDEX_FILE_PATH  = "creators.json";
+
+const VALID_CREATOR_TYPES = new Set(["author", "musician", "artist", "photographer", "filmmaker", "band"]);
+const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,39}$/;
+const REPO_RE = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/;
 
 // Repos the platform recognizes. Anything not on this list gets 403 —
 // the bot won't post to arbitrary repos even if someone crafts a request.
@@ -50,7 +59,8 @@ export default {
     if (request.method === "OPTIONS") return preflight(request);
     const isComments = url.pathname.startsWith(COMMENTS_PREFIX);
     const isLikes    = url.pathname.startsWith(LIKES_PREFIX);
-    if (!isComments && !isLikes) {
+    const isRegister = url.pathname.startsWith(REGISTER_PREFIX);
+    if (!isComments && !isLikes && !isRegister) {
       return new Response("not found", { status: 404 });
     }
 
@@ -88,7 +98,172 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
     if (request.method === "POST" && suffix === "") return toggleLike(request, env);
     return jsonError(404, `no route: ${request.method} /api/likes${suffix}`);
   }
+  // ── /api/register ───────────────────────────────────────────────
+  if (url.pathname.startsWith(REGISTER_PREFIX)) {
+    const suffix = url.pathname.slice(REGISTER_PREFIX.length);
+    if (request.method === "POST" && suffix === "") return registerCreator(request, env);
+    return jsonError(404, `no route: ${request.method} /api/register${suffix}`);
+  }
   return jsonError(404, `no route: ${request.method} ${url.pathname}`);
+}
+
+// ─── Register (self-serve creator onboarding) ───────────────────────────────
+//
+// POST /api/register { googleIdToken, repo }
+//   where repo is "owner/name" (or a github.com URL we'll extract from)
+//
+// Flow:
+//   1. Verify Google JWT — get the caller's identity
+//   2. Fetch the repo's .algorithmic-arts.json via GitHub raw
+//   3. Validate the manifest schema
+//   4. GET the current creators.json + SHA from the index repo
+//   5. Check slug uniqueness against the existing roster
+//   6. Append the new creator with registeredBy + registeredAt
+//   7. PUT the updated file back (as the platform bot)
+//   8. Return the new creator record so the wizard can render success
+//
+// Manifest expected at <repo>/.algorithmic-arts.json:
+//   {
+//     "creator": {
+//       "name":     "...",             // required
+//       "slug":     "...",             // required, unique; [a-z0-9][a-z0-9-]{1,39}
+//       "types":    ["author", ...],   // required; ⊂ VALID_CREATOR_TYPES
+//       "bio":      "...",             // optional
+//       "portrait": "path/in/repo",    // optional; converted to raw URL server-side
+//       "register": "...",             // optional short subtitle
+//       "epigraph": "..."              // optional single-quote line
+//     }
+//   }
+
+interface CreatorManifest {
+  name: string;
+  slug: string;
+  types: string[];
+  bio?: string;
+  portrait?: string;
+  register?: string;
+  epigraph?: string;
+}
+
+interface CreatorRecord extends CreatorManifest {
+  repo: string;             // "owner/name"
+  registeredBy: string;
+  registeredAt: string;
+}
+
+async function registerCreator(request: Request, env: Env): Promise<Response> {
+  const payload = await parseJson(request);
+  if (!payload) return jsonError(400, "invalid JSON body");
+  const { googleIdToken, repo } = payload as { googleIdToken?: string; repo?: string };
+  if (typeof googleIdToken !== "string") return jsonError(400, "missing googleIdToken");
+  if (typeof repo !== "string" || repo.trim().length === 0) return jsonError(400, "missing repo");
+
+  const identity = await verifyGoogleToken(googleIdToken, env);
+  if (!identity) return jsonError(401, "invalid or expired Google token");
+
+  // Normalize repo — accept full URL or owner/name
+  let repoPath = repo.trim();
+  const urlMatch = /github\.com\/([^\/]+\/[^\/#?\s]+)/.exec(repoPath);
+  if (urlMatch) repoPath = urlMatch[1];
+  repoPath = repoPath.replace(/\.git$/, "").replace(/^\/+|\/+$/g, "");
+  if (!REPO_RE.test(repoPath)) return jsonError(400, `repo must be owner/name (got: ${repoPath.slice(0, 100)})`);
+  const [owner, name] = repoPath.split("/");
+
+  // Fetch the manifest — use HEAD (main or master, follows default branch)
+  const manifestUrl = `https://raw.githubusercontent.com/${owner}/${name}/HEAD/.algorithmic-arts.json`;
+  const mfResp = await fetch(manifestUrl);
+  if (mfResp.status === 404) {
+    return jsonError(404, `no .algorithmic-arts.json at root of ${repoPath} — add the manifest and try again`);
+  }
+  if (!mfResp.ok) {
+    return jsonError(mfResp.status, `couldn't fetch manifest: HTTP ${mfResp.status}`);
+  }
+  let manifestJson: unknown;
+  try { manifestJson = await mfResp.json(); }
+  catch { return jsonError(400, ".algorithmic-arts.json is not valid JSON"); }
+  const creatorRaw = (manifestJson as { creator?: unknown }).creator;
+  if (!creatorRaw || typeof creatorRaw !== "object") {
+    return jsonError(400, "manifest missing top-level `creator` object");
+  }
+  const validation = validateCreator(creatorRaw as Record<string, unknown>);
+  if ("error" in validation) return jsonError(400, validation.error);
+  const creator = validation.value;
+
+  // Fetch current creators.json + SHA
+  const idxResp = await ghFetch(env, `https://api.github.com/repos/${INDEX_REPO_OWNER}/${INDEX_REPO_NAME}/contents/${INDEX_FILE_PATH}`);
+  if (!idxResp.ok) return jsonError(500, `couldn't read the index: HTTP ${idxResp.status}`);
+  const idxFile = await idxResp.json() as { content: string; sha: string; encoding: string };
+  if (idxFile.encoding !== "base64") return jsonError(500, `index file has unexpected encoding: ${idxFile.encoding}`);
+  const idxContent = atob(idxFile.content.replace(/\n/g, ""));
+  let roster: CreatorRecord[];
+  try { roster = JSON.parse(idxContent) as CreatorRecord[]; }
+  catch { return jsonError(500, "index file is not valid JSON"); }
+
+  // Slug uniqueness
+  if (roster.some((c) => c.slug === creator.slug)) {
+    return jsonError(409, `slug "${creator.slug}" is already registered — pick a different slug in your manifest`);
+  }
+  // Also prevent double-registering the same repo
+  if (roster.some((c) => c.repo === repoPath)) {
+    return jsonError(409, `repo ${repoPath} is already registered`);
+  }
+
+  // Convert relative portrait path to raw URL
+  if (creator.portrait && !/^https?:\/\//.test(creator.portrait)) {
+    creator.portrait = `https://raw.githubusercontent.com/${owner}/${name}/HEAD/${creator.portrait.replace(/^\/+/, "")}`;
+  }
+
+  const now = new Date(mfResp.headers.get("date") ?? "").toISOString();
+  const newRecord: CreatorRecord = {
+    ...creator,
+    repo: repoPath,
+    registeredBy: identity.email,
+    registeredAt: now === "Invalid Date" ? "" : now,
+  };
+  roster.push(newRecord);
+
+  // Commit the update
+  const newContent = btoa(JSON.stringify(roster, null, 2) + "\n");
+  const putResp = await ghFetch(env, `https://api.github.com/repos/${INDEX_REPO_OWNER}/${INDEX_REPO_NAME}/contents/${INDEX_FILE_PATH}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      message: `Register ${creator.slug} (${creator.name})\n\nvia /create by ${identity.email}`,
+      content: newContent,
+      sha: idxFile.sha,
+    }),
+  });
+  if (!putResp.ok) return passUpstreamError(putResp);
+
+  return jsonOk({ creator: newRecord, rosterSize: roster.length });
+}
+
+function validateCreator(raw: Record<string, unknown>): { error: string } | { value: CreatorManifest } {
+  const name = raw.name;
+  const slug = raw.slug;
+  const types = raw.types;
+  if (typeof name !== "string" || name.trim().length === 0) return { error: "creator.name is required" };
+  if (typeof slug !== "string" || !SLUG_RE.test(slug))       return { error: "creator.slug must match [a-z0-9][a-z0-9-]{1,39}" };
+  if (!Array.isArray(types) || types.length === 0)           return { error: "creator.types must be a non-empty array" };
+  for (const t of types) {
+    if (typeof t !== "string" || !VALID_CREATOR_TYPES.has(t)) {
+      return { error: `unknown creator type "${t}" — valid: ${[...VALID_CREATOR_TYPES].join(", ")}` };
+    }
+  }
+  const bio      = typeof raw.bio      === "string" ? raw.bio      : undefined;
+  const portrait = typeof raw.portrait === "string" ? raw.portrait : undefined;
+  const register = typeof raw.register === "string" ? raw.register : undefined;
+  const epigraph = typeof raw.epigraph === "string" ? raw.epigraph : undefined;
+  return {
+    value: {
+      name: name.trim().slice(0, 120),
+      slug,
+      types,
+      ...(bio      ? { bio:      bio.trim().slice(0, 800) }      : {}),
+      ...(portrait ? { portrait: portrait.trim() }               : {}),
+      ...(register ? { register: register.trim().slice(0, 120) } : {}),
+      ...(epigraph ? { epigraph: epigraph.trim().slice(0, 240) } : {}),
+    },
+  };
 }
 
 // ─── Likes (KV-backed) ──────────────────────────────────────────────────────
