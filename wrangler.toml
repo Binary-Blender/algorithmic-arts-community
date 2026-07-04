@@ -6,3 +6,11 @@ compatibility_flags = ["nodejs_compat"]
 # Secrets (set via `wrangler secret put`):
 #   GITHUB_TOKEN       — classic PAT (bot posting on any Binary-Blender repo)
 #   GOOGLE_CLIENT_IDS  — comma-separated allowlist of Google OAuth client IDs
+
+# KV — per-user like state + per-content counter for the ♡ button.
+# Keys:
+#   like:<content>:<issue>:<sub>   → epoch ms of the like (presence = liked)
+#   count:<content>:<issue>        → integer as string
+[[kv_namespaces]]
+binding = "AA_LIKES"
+id = "a5fa1aea07ce43a5a2774fd8a9fd7ab0"

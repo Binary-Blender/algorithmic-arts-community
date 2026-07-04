@@ -15,9 +15,12 @@ interface Env {
   GITHUB_TOKEN: string;
   /** Comma-separated allowlist of Google OAuth client IDs. */
   GOOGLE_CLIENT_IDS: string;
+  /** KV: per-user like state + per-content counter for the ♡ button. */
+  AA_LIKES: KVNamespace;
 }
 
-const PROXY_PREFIX = "/api/comments";
+const COMMENTS_PREFIX = "/api/comments";
+const LIKES_PREFIX    = "/api/likes";
 
 // Repos the platform recognizes. Anything not on this list gets 403 —
 // the bot won't post to arbitrary repos even if someone crafts a request.
@@ -45,7 +48,9 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return preflight(request);
-    if (!url.pathname.startsWith(PROXY_PREFIX)) {
+    const isComments = url.pathname.startsWith(COMMENTS_PREFIX);
+    const isLikes    = url.pathname.startsWith(LIKES_PREFIX);
+    if (!isComments && !isLikes) {
       return new Response("not found", { status: 404 });
     }
 
@@ -66,21 +71,100 @@ export default {
 // ─── Routing ────────────────────────────────────────────────────────────────
 
 async function route(request: Request, env: Env, url: URL): Promise<Response> {
-  const suffix = url.pathname.slice(PROXY_PREFIX.length);
+  // ── /api/comments ────────────────────────────────────────────────
+  if (url.pathname.startsWith(COMMENTS_PREFIX)) {
+    const suffix = url.pathname.slice(COMMENTS_PREFIX.length);
+    if (suffix === "/ping") {
+      return new Response("pong", { status: 200, headers: { "Content-Type": "text/plain" } });
+    }
+    if (request.method === "GET"  && suffix === "") return listComments(env, url);
+    if (request.method === "POST" && suffix === "") return postComment(request, env);
+    return jsonError(404, `no route: ${request.method} /api/comments${suffix}`);
+  }
+  // ── /api/likes ──────────────────────────────────────────────────
+  if (url.pathname.startsWith(LIKES_PREFIX)) {
+    const suffix = url.pathname.slice(LIKES_PREFIX.length);
+    if (request.method === "GET"  && suffix === "") return getLikes(env, url);
+    if (request.method === "POST" && suffix === "") return toggleLike(request, env);
+    return jsonError(404, `no route: ${request.method} /api/likes${suffix}`);
+  }
+  return jsonError(404, `no route: ${request.method} ${url.pathname}`);
+}
 
-  if (suffix === "/ping") {
-    return new Response("pong", { status: 200, headers: { "Content-Type": "text/plain" } });
-  }
+// ─── Likes (KV-backed) ──────────────────────────────────────────────────────
+//
+// Storage:
+//   like:<content>:<issue>:<sub>   → epoch ms of the like (presence == liked)
+//   count:<content>:<issue>        → total count as a string
+//
+// Read GET /api/likes?content=X&issue=N[&sub=Y] returns {count, liked}
+// where `liked` is present only if a sub was supplied. This lets the
+// frontend show the count to anonymous readers and highlight the button
+// for the signed-in user in one round trip.
+//
+// Toggle POST /api/likes {googleIdToken, content, issue} flips the state
+// and returns the new {count, liked}. KV writes are eventually consistent
+// but per-key ordering is preserved.
 
-  // GET /api/comments?content=<slug>&issue=<n>
-  if (request.method === "GET" && suffix === "") {
-    return listComments(env, url);
+async function getLikes(env: Env, url: URL): Promise<Response> {
+  const contentSlug = url.searchParams.get("content");
+  const issueParam  = url.searchParams.get("issue");
+  const sub         = url.searchParams.get("sub");
+  if (!contentSlug) return jsonError(400, "missing content parameter");
+  if (!issueParam)  return jsonError(400, "missing issue parameter");
+  const repoRef = REPO_ALLOWLIST[contentSlug];
+  if (!repoRef) return jsonError(403, `unknown content slug: ${contentSlug}`);
+  const issue = Number(issueParam);
+  if (!Number.isFinite(issue) || issue < 1) return jsonError(400, "issue must be a positive integer");
+
+  const countKey = `count:${contentSlug}:${issue}`;
+  const countStr = await env.AA_LIKES.get(countKey);
+  const count = countStr ? Math.max(0, parseInt(countStr, 10)) : 0;
+
+  const payload: { count: number; liked?: boolean } = { count };
+  if (sub && sub.length > 0) {
+    const likeKey = `like:${contentSlug}:${issue}:${sub}`;
+    const has = await env.AA_LIKES.get(likeKey);
+    payload.liked = has !== null;
   }
-  // POST /api/comments — body { googleIdToken, content, issue, body }
-  if (request.method === "POST" && suffix === "") {
-    return postComment(request, env);
+  return jsonOk(payload);
+}
+
+async function toggleLike(request: Request, env: Env): Promise<Response> {
+  const payload = await parseJson(request);
+  if (!payload) return jsonError(400, "invalid JSON body");
+  const { googleIdToken, content, issue } = payload as {
+    googleIdToken?: string; content?: string; issue?: number;
+  };
+  if (typeof googleIdToken !== "string") return jsonError(400, "missing googleIdToken");
+  if (typeof content !== "string")       return jsonError(400, "missing content");
+  if (typeof issue !== "number")         return jsonError(400, "missing issue");
+
+  const repoRef = REPO_ALLOWLIST[content];
+  if (!repoRef) return jsonError(403, `unknown content slug: ${content}`);
+
+  const identity = await verifyGoogleToken(googleIdToken, env);
+  if (!identity) return jsonError(401, "invalid or expired Google token");
+
+  const likeKey  = `like:${content}:${issue}:${identity.sub}`;
+  const countKey = `count:${content}:${issue}`;
+
+  const existing = await env.AA_LIKES.get(likeKey);
+  let count = Number((await env.AA_LIKES.get(countKey)) ?? "0") || 0;
+
+  if (existing !== null) {
+    // Was liked → unlike
+    await env.AA_LIKES.delete(likeKey);
+    count = Math.max(0, count - 1);
+    await env.AA_LIKES.put(countKey, String(count));
+    return jsonOk({ count, liked: false });
+  } else {
+    // Was not liked → like
+    await env.AA_LIKES.put(likeKey, String(Date.now()));
+    count = count + 1;
+    await env.AA_LIKES.put(countKey, String(count));
+    return jsonOk({ count, liked: true });
   }
-  return jsonError(404, `no route: ${request.method} ${suffix}`);
 }
 
 // ─── Read path (unauthenticated) ────────────────────────────────────────────
