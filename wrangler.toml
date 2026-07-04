@@ -1,0 +1,8 @@
+name = "algorithmic-arts-community"
+main = "worker/index.ts"
+compatibility_date = "2026-07-04"
+compatibility_flags = ["nodejs_compat"]
+
+# Secrets (set via `wrangler secret put`):
+#   GITHUB_TOKEN       — classic PAT (bot posting on any Binary-Blender repo)
+#   GOOGLE_CLIENT_IDS  — comma-separated allowlist of Google OAuth client IDs

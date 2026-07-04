@@ -1,0 +1,15 @@
+{
+  "name": "algorithmic-arts-community-worker",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Cloudflare Worker: Google-SSO-gated comment proxy for content repos in the Algorithmic Arts imprint. Validates Google sign-in, attributes posts, and routes through the GitHub Issues API to the content's own repo.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20260629.1",
+    "typescript": "5.6.3",
+    "wrangler": "4.105.0"
+  }
+}
