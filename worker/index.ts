@@ -44,6 +44,7 @@ const REPO_ALLOWLIST: Record<string, { owner: string; repo: string }> = {
 };
 
 const ALLOWED_ORIGINS = new Set([
+  "https://net.binary-blender.com",
   "https://algorithmic-arts.binary-blender.com",
   "https://aiwinwin.binary-blender.com",
   "http://localhost:5173",
