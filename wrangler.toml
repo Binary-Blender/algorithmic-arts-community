@@ -14,3 +14,13 @@ compatibility_flags = ["nodejs_compat"]
 [[kv_namespaces]]
 binding = "AA_LIKES"
 id = "a5fa1aea07ce43a5a2774fd8a9fd7ab0"
+
+# KV — cross-medium links between content items on the platform.
+# Keys:
+#   link:<id>                            → JSON  {from, to, note, sub, email, name, createdAt}
+#   linkout:<fromCreator>/<fromContent>:<id>  → id (index for "outgoing" listing)
+#   linkin:<toCreator>/<toContent>:<id>       → id (index for "incoming" listing)
+# id = `<ms-timestamp>-<8-char-random>`  — sortable, unique enough
+[[kv_namespaces]]
+binding = "AA_LINKS"
+id = "b97dd4fda6ee4a249ceccf086f92f5ca"

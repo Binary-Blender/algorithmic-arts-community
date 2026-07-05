@@ -17,11 +17,14 @@ interface Env {
   GOOGLE_CLIENT_IDS: string;
   /** KV: per-user like state + per-content counter for the ♡ button. */
   AA_LIKES: KVNamespace;
+  /** KV: user-authored links between content items ("this reminded me of…"). */
+  AA_LINKS: KVNamespace;
 }
 
 const COMMENTS_PREFIX = "/api/comments";
 const LIKES_PREFIX    = "/api/likes";
 const REGISTER_PREFIX = "/api/register";
+const LINKS_PREFIX    = "/api/links";
 
 const INDEX_REPO_OWNER = "Binary-Blender";
 const INDEX_REPO_NAME  = "algorithmic-arts-index";
@@ -61,7 +64,8 @@ export default {
     const isComments = url.pathname.startsWith(COMMENTS_PREFIX);
     const isLikes    = url.pathname.startsWith(LIKES_PREFIX);
     const isRegister = url.pathname.startsWith(REGISTER_PREFIX);
-    if (!isComments && !isLikes && !isRegister) {
+    const isLinks    = url.pathname.startsWith(LINKS_PREFIX);
+    if (!isComments && !isLikes && !isRegister && !isLinks) {
       return new Response("not found", { status: 404 });
     }
 
@@ -105,7 +109,161 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
     if (request.method === "POST" && suffix === "") return registerCreator(request, env);
     return jsonError(404, `no route: ${request.method} /api/register${suffix}`);
   }
+  // ── /api/links ──────────────────────────────────────────────────
+  if (url.pathname.startsWith(LINKS_PREFIX)) {
+    const suffix = url.pathname.slice(LINKS_PREFIX.length);
+    if (request.method === "GET"    && suffix === "") return listLinks(env, url);
+    if (request.method === "POST"   && suffix === "") return createLink(request, env);
+    const delMatch = /^\/([^\/]+)$/.exec(suffix);
+    if (request.method === "DELETE" && delMatch)      return deleteLink(request, env, delMatch[1]);
+    return jsonError(404, `no route: ${request.method} /api/links${suffix}`);
+  }
   return jsonError(404, `no route: ${request.method} ${url.pathname}`);
+}
+
+// ─── Cross-medium links ─────────────────────────────────────────────────────
+//
+// A link is a user-authored connection between two content items on the
+// platform ("this reminded me of..."). Both endpoints must be community
+// content items validated against the roster + their manifests.
+//
+// Storage (AA_LINKS):
+//   link:<id>             → JSON  { id, from:{creator,content}, to:{creator,content},
+//                                   note, sub, email, name, createdAt }
+//   linkout:<F>:<id>      → id    (F = <fromCreator>/<fromContent>)
+//   linkin:<T>:<id>       → id    (T = <toCreator>/<toContent>)
+//
+// id format: `<ms>-<random8>` — timestamp-prefixed so list() returns
+// newest-last naturally, and we can slice to newest-first without an
+// extra sort. Random suffix disambiguates same-ms creations.
+
+interface LinkRecord {
+  id: string;
+  from: { creator: string; content: string };
+  to:   { creator: string; content: string };
+  note: string;
+  sub:  string;
+  email: string;
+  name: string;
+  createdAt: string;
+}
+
+async function listLinks(env: Env, url: URL): Promise<Response> {
+  const direction = url.searchParams.get("direction");
+  const creator   = url.searchParams.get("creator");
+  const content   = url.searchParams.get("content");
+  if (direction !== "out" && direction !== "in") {
+    return jsonError(400, "direction must be 'out' or 'in'");
+  }
+  if (!creator || !content) return jsonError(400, "creator and content required");
+
+  const prefix = direction === "out"
+    ? `linkout:${creator}/${content}:`
+    : `linkin:${creator}/${content}:`;
+  const listResp = await env.AA_LINKS.list({ prefix, limit: 500 });
+  const ids = listResp.keys.map((k) => k.name.slice(prefix.length));
+  // Read all link records in parallel
+  const records = await Promise.all(ids.map((id) => env.AA_LINKS.get(`link:${id}`)));
+  const links = records
+    .map((r) => { try { return r ? JSON.parse(r) as LinkRecord : null; } catch { return null; } })
+    .filter((r): r is LinkRecord => r !== null)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));  // newest first
+
+  // Redact identifying details to avoid exposing email — only the display
+  // name and a short sub hash come out. sub-full is present only on the
+  // record we later use to authorize deletion.
+  const publicLinks = links.map((r) => ({
+    id: r.id,
+    from: r.from,
+    to:   r.to,
+    note: r.note,
+    createdAt: r.createdAt,
+    author: { name: r.name, subHash: r.sub.slice(-8) },
+  }));
+  return jsonOk({ links: publicLinks });
+}
+
+async function createLink(request: Request, env: Env): Promise<Response> {
+  const payload = await parseJson(request);
+  if (!payload) return jsonError(400, "invalid JSON body");
+  const p = payload as {
+    googleIdToken?: string;
+    from?: { creator?: string; content?: string };
+    to?:   { creator?: string; content?: string };
+    note?: string;
+  };
+  if (typeof p.googleIdToken !== "string") return jsonError(400, "missing googleIdToken");
+  if (!p.from || typeof p.from.creator !== "string" || typeof p.from.content !== "string") return jsonError(400, "missing/invalid 'from' target");
+  if (!p.to   || typeof p.to.creator   !== "string" || typeof p.to.content   !== "string") return jsonError(400, "missing/invalid 'to' target");
+  const note = typeof p.note === "string" ? p.note.trim().slice(0, 500) : "";
+  if (p.from.creator === p.to.creator && p.from.content === p.to.content) {
+    return jsonError(400, "can't link a content to itself");
+  }
+
+  const identity = await verifyGoogleToken(p.googleIdToken, env);
+  if (!identity) return jsonError(401, "invalid or expired Google token");
+
+  // Validate both endpoints — must be community content items on the platform
+  const fromV = await validateCommunityTarget(p.from.creator, p.from.content);
+  if ("error" in fromV) return jsonError(fromV.status ?? 400, `from: ${fromV.error}`);
+  const toV = await validateCommunityTarget(p.to.creator, p.to.content);
+  if ("error" in toV)   return jsonError(toV.status   ?? 400, `to: ${toV.error}`);
+
+  // Duplicate check: same author, same from, same to → 409
+  const outPrefix = `linkout:${p.from.creator}/${p.from.content}:`;
+  const existing = await env.AA_LINKS.list({ prefix: outPrefix, limit: 500 });
+  for (const key of existing.keys) {
+    const id = key.name.slice(outPrefix.length);
+    const rec = await env.AA_LINKS.get(`link:${id}`);
+    if (!rec) continue;
+    try {
+      const r = JSON.parse(rec) as LinkRecord;
+      if (r.sub === identity.sub &&
+          r.to.creator === p.to.creator && r.to.content === p.to.content) {
+        return jsonError(409, "you already created this link");
+      }
+    } catch { /* ignore */ }
+  }
+
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const record: LinkRecord = {
+    id,
+    from: { creator: p.from.creator, content: p.from.content },
+    to:   { creator: p.to.creator,   content: p.to.content   },
+    note,
+    sub:   identity.sub,
+    email: identity.email,
+    name:  identity.name,
+    createdAt: new Date().toISOString(),
+  };
+  await env.AA_LINKS.put(`link:${id}`, JSON.stringify(record));
+  await env.AA_LINKS.put(`linkout:${p.from.creator}/${p.from.content}:${id}`, id);
+  await env.AA_LINKS.put(`linkin:${p.to.creator}/${p.to.content}:${id}`, id);
+  return jsonOk({ link: {
+    id, from: record.from, to: record.to, note, createdAt: record.createdAt,
+    author: { name: identity.name, subHash: identity.sub.slice(-8) },
+  } });
+}
+
+async function deleteLink(request: Request, env: Env, linkId: string): Promise<Response> {
+  const payload = await parseJson(request);
+  if (!payload) return jsonError(400, "invalid JSON body");
+  const p = payload as { googleIdToken?: string };
+  if (typeof p.googleIdToken !== "string") return jsonError(400, "missing googleIdToken");
+  const identity = await verifyGoogleToken(p.googleIdToken, env);
+  if (!identity) return jsonError(401, "invalid or expired Google token");
+
+  const rec = await env.AA_LINKS.get(`link:${linkId}`);
+  if (!rec) return jsonError(404, "link not found");
+  let record: LinkRecord;
+  try { record = JSON.parse(rec) as LinkRecord; }
+  catch { return jsonError(500, "corrupt link record"); }
+  if (record.sub !== identity.sub) return jsonError(403, "only the author can delete this link");
+
+  await env.AA_LINKS.delete(`link:${linkId}`);
+  await env.AA_LINKS.delete(`linkout:${record.from.creator}/${record.from.content}:${linkId}`);
+  await env.AA_LINKS.delete(`linkin:${record.to.creator}/${record.to.content}:${linkId}`);
+  return jsonOk({ deleted: linkId });
 }
 
 // ─── Register (self-serve creator onboarding) ───────────────────────────────
