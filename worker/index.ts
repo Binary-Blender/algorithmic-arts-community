@@ -504,7 +504,7 @@ async function findContentIssue(env: Env, owner: string, repo: string, label: st
 }
 
 async function createContentIssue(env: Env, owner: string, repo: string, contentSlug: string, title: string, creatorSlug: string): Promise<number> {
-  const url = `https://net.binary-blender.com/content?creator=${encodeURIComponent(creatorSlug)}&content=${encodeURIComponent(contentSlug)}`;
+  const url = `https://net.binary-blender.com/creators/${encodeURIComponent(creatorSlug)}/${encodeURIComponent(contentSlug)}`;
   const resp = await ghFetch(env, `https://api.github.com/repos/${owner}/${repo}/issues`, {
     method: "POST",
     body: JSON.stringify({
