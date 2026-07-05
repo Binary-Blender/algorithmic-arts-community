@@ -283,23 +283,17 @@ function validateCreator(raw: Record<string, unknown>): { error: string } | { va
 // but per-key ordering is preserved.
 
 async function getLikes(env: Env, url: URL): Promise<Response> {
-  const contentSlug = url.searchParams.get("content");
-  const issueParam  = url.searchParams.get("issue");
-  const sub         = url.searchParams.get("sub");
-  if (!contentSlug) return jsonError(400, "missing content parameter");
-  if (!issueParam)  return jsonError(400, "missing issue parameter");
-  const repoRef = REPO_ALLOWLIST[contentSlug];
-  if (!repoRef) return jsonError(403, `unknown content slug: ${contentSlug}`);
-  const issue = Number(issueParam);
-  if (!Number.isFinite(issue) || issue < 1) return jsonError(400, "issue must be a positive integer");
+  const kp = await resolveKeyPrefixFromUrl(env, url);
+  if ("error" in kp) return jsonError(kp.status ?? 400, kp.error);
+  const sub = url.searchParams.get("sub");
 
-  const countKey = `count:${contentSlug}:${issue}`;
+  const countKey = `count:${kp.keyPrefix}`;
   const countStr = await env.AA_LIKES.get(countKey);
   const count = countStr ? Math.max(0, parseInt(countStr, 10)) : 0;
 
   const payload: { count: number; liked?: boolean } = { count };
   if (sub && sub.length > 0) {
-    const likeKey = `like:${contentSlug}:${issue}:${sub}`;
+    const likeKey = `like:${kp.keyPrefix}:${sub}`;
     const has = await env.AA_LIKES.get(likeKey);
     payload.liked = has !== null;
   }
@@ -309,33 +303,27 @@ async function getLikes(env: Env, url: URL): Promise<Response> {
 async function toggleLike(request: Request, env: Env): Promise<Response> {
   const payload = await parseJson(request);
   if (!payload) return jsonError(400, "invalid JSON body");
-  const { googleIdToken, content, issue } = payload as {
-    googleIdToken?: string; content?: string; issue?: number;
-  };
+  const { googleIdToken } = payload as { googleIdToken?: string };
   if (typeof googleIdToken !== "string") return jsonError(400, "missing googleIdToken");
-  if (typeof content !== "string")       return jsonError(400, "missing content");
-  if (typeof issue !== "number")         return jsonError(400, "missing issue");
-
-  const repoRef = REPO_ALLOWLIST[content];
-  if (!repoRef) return jsonError(403, `unknown content slug: ${content}`);
 
   const identity = await verifyGoogleToken(googleIdToken, env);
   if (!identity) return jsonError(401, "invalid or expired Google token");
 
-  const likeKey  = `like:${content}:${issue}:${identity.sub}`;
-  const countKey = `count:${content}:${issue}`;
+  const kp = await resolveKeyPrefixFromBody(env, payload as Record<string, unknown>);
+  if ("error" in kp) return jsonError(kp.status ?? 400, kp.error);
+
+  const likeKey  = `like:${kp.keyPrefix}:${identity.sub}`;
+  const countKey = `count:${kp.keyPrefix}`;
 
   const existing = await env.AA_LIKES.get(likeKey);
   let count = Number((await env.AA_LIKES.get(countKey)) ?? "0") || 0;
 
   if (existing !== null) {
-    // Was liked → unlike
     await env.AA_LIKES.delete(likeKey);
     count = Math.max(0, count - 1);
     await env.AA_LIKES.put(countKey, String(count));
     return jsonOk({ count, liked: false });
   } else {
-    // Was not liked → like
     await env.AA_LIKES.put(likeKey, String(Date.now()));
     count = count + 1;
     await env.AA_LIKES.put(countKey, String(count));
@@ -343,21 +331,224 @@ async function toggleLike(request: Request, env: Env): Promise<Response> {
   }
 }
 
+// ─── Target resolution (studio vs community) ────────────────────────────────
+//
+// Two shapes converge here:
+//   1. Studio hardcoded — {content, issue} where content ∈ REPO_ALLOWLIST
+//      and issue is a specific pre-created GitHub Issue number. Legacy.
+//   2. Community — {creator, contentSlug} where creator is a registered
+//      slug from the central roster and contentSlug is a slug that must
+//      appear in that creator's manifest.content[]. The GitHub issue is
+//      resolved by label (content:<contentSlug>); lazy-created on first
+//      comment POST.
+//
+// KV key namespaces are kept distinct so studio and community targets
+// never collide even if slugs happen to match:
+//   studio:    <content>:<issue>
+//   community: community/<creator>/<contentSlug>
+
+interface ResolvedTarget {
+  owner: string;
+  repo: string;
+  /** null in community mode when no issue exists yet + we're not creating */
+  issue: number | null;
+  /** Content title for empty-thread rendering (community only) */
+  contentTitle?: string;
+}
+
+interface ResolveError { error: string; status?: number; }
+
+async function resolveFromUrl(env: Env, url: URL, createIfMissing: boolean): Promise<ResolvedTarget | ResolveError> {
+  const contentKey  = url.searchParams.get("content");
+  const issueParam  = url.searchParams.get("issue");
+  const creator     = url.searchParams.get("creator");
+  const contentSlug = url.searchParams.get("contentSlug");
+
+  if (creator && contentSlug) {
+    return resolveCommunity(env, creator, contentSlug, createIfMissing);
+  }
+  if (contentKey && issueParam) {
+    return resolveStudio(contentKey, Number(issueParam));
+  }
+  return { error: "provide either (content, issue) or (creator, contentSlug)" };
+}
+
+async function resolveFromBody(env: Env, body: Record<string, unknown>, createIfMissing: boolean): Promise<ResolvedTarget | ResolveError> {
+  const contentKey  = typeof body.content === "string" ? body.content : undefined;
+  const issueNum    = typeof body.issue === "number" ? body.issue : undefined;
+  const creator     = typeof body.creator === "string" ? body.creator : undefined;
+  const contentSlug = typeof body.contentSlug === "string" ? body.contentSlug : undefined;
+
+  if (creator && contentSlug) {
+    return resolveCommunity(env, creator, contentSlug, createIfMissing);
+  }
+  if (contentKey && typeof issueNum === "number") {
+    return resolveStudio(contentKey, issueNum);
+  }
+  return { error: "provide either (content, issue) or (creator, contentSlug)" };
+}
+
+function resolveStudio(contentKey: string, issue: number): ResolvedTarget | ResolveError {
+  const repoRef = REPO_ALLOWLIST[contentKey];
+  if (!repoRef) return { error: `unknown content slug: ${contentKey}`, status: 403 };
+  if (!Number.isFinite(issue) || issue < 1) return { error: "issue must be a positive integer" };
+  return { owner: repoRef.owner, repo: repoRef.repo, issue };
+}
+
+async function resolveCommunity(env: Env, creatorSlug: string, contentSlug: string, createIfMissing: boolean): Promise<ResolvedTarget | ResolveError> {
+  const roster = await fetchRoster();
+  if (!roster) return { error: "couldn't load the roster", status: 502 };
+  const c = roster.find((x) => x.slug === creatorSlug);
+  if (!c) return { error: `no creator with slug: ${creatorSlug}`, status: 404 };
+
+  const [owner, repo] = c.repo.split("/");
+  const manifest = await fetchManifest(c.repo);
+  if (!manifest) return { error: `couldn't load manifest for ${c.repo}`, status: 502 };
+  const content = (Array.isArray(manifest.content) ? manifest.content : []) as Array<{ slug?: string; title?: string }>;
+  const item = content.find((i) => i.slug === contentSlug);
+  if (!item) return { error: `no content "${contentSlug}" in ${c.repo}`, status: 404 };
+
+  const label = `content:${contentSlug}`;
+  const existing = await findContentIssue(env, owner, repo, label);
+  if (existing !== null) {
+    return { owner, repo, issue: existing, contentTitle: item.title ?? contentSlug };
+  }
+  if (!createIfMissing) {
+    return { owner, repo, issue: null, contentTitle: item.title ?? contentSlug };
+  }
+  const created = await createContentIssue(env, owner, repo, contentSlug, item.title ?? contentSlug, creatorSlug);
+  return { owner, repo, issue: created, contentTitle: item.title ?? contentSlug };
+}
+
+async function resolveKeyPrefixFromUrl(_env: Env, url: URL): Promise<{ keyPrefix: string } | ResolveError> {
+  const contentKey  = url.searchParams.get("content");
+  const issueParam  = url.searchParams.get("issue");
+  const creator     = url.searchParams.get("creator");
+  const contentSlug = url.searchParams.get("contentSlug");
+  if (creator && contentSlug) {
+    const validated = await validateCommunityTarget(creator, contentSlug);
+    if ("error" in validated) return validated;
+    return { keyPrefix: `community/${creator}/${contentSlug}` };
+  }
+  if (contentKey && issueParam) {
+    const issue = Number(issueParam);
+    if (!REPO_ALLOWLIST[contentKey]) return { error: `unknown content slug: ${contentKey}`, status: 403 };
+    if (!Number.isFinite(issue) || issue < 1) return { error: "issue must be a positive integer" };
+    return { keyPrefix: `${contentKey}:${issue}` };
+  }
+  return { error: "provide either (content, issue) or (creator, contentSlug)" };
+}
+
+async function resolveKeyPrefixFromBody(_env: Env, body: Record<string, unknown>): Promise<{ keyPrefix: string } | ResolveError> {
+  const contentKey  = typeof body.content === "string" ? body.content : undefined;
+  const issueNum    = typeof body.issue === "number" ? body.issue : undefined;
+  const creator     = typeof body.creator === "string" ? body.creator : undefined;
+  const contentSlug = typeof body.contentSlug === "string" ? body.contentSlug : undefined;
+  if (creator && contentSlug) {
+    const validated = await validateCommunityTarget(creator, contentSlug);
+    if ("error" in validated) return validated;
+    return { keyPrefix: `community/${creator}/${contentSlug}` };
+  }
+  if (contentKey && typeof issueNum === "number") {
+    if (!REPO_ALLOWLIST[contentKey]) return { error: `unknown content slug: ${contentKey}`, status: 403 };
+    return { keyPrefix: `${contentKey}:${issueNum}` };
+  }
+  return { error: "provide either (content, issue) or (creator, contentSlug)" };
+}
+
+async function validateCommunityTarget(creatorSlug: string, contentSlug: string): Promise<{ repo: string; title: string } | ResolveError> {
+  const roster = await fetchRoster();
+  if (!roster) return { error: "couldn't load the roster", status: 502 };
+  const c = roster.find((x) => x.slug === creatorSlug);
+  if (!c) return { error: `no creator with slug: ${creatorSlug}`, status: 404 };
+  const manifest = await fetchManifest(c.repo);
+  if (!manifest) return { error: `couldn't load manifest for ${c.repo}`, status: 502 };
+  const content = (Array.isArray(manifest.content) ? manifest.content : []) as Array<{ slug?: string; title?: string }>;
+  const item = content.find((i) => i.slug === contentSlug);
+  if (!item) return { error: `no content "${contentSlug}" in ${c.repo}`, status: 404 };
+  return { repo: c.repo, title: item.title ?? contentSlug };
+}
+
+// ─── Helpers for community resolution ──────────────────────────────────────
+
+interface CachedRoster { fetchedAt: number; data: CreatorRecord[]; }
+let rosterCache: CachedRoster | null = null;
+const ROSTER_CACHE_MS = 60_000;
+
+async function fetchRoster(): Promise<CreatorRecord[] | null> {
+  if (rosterCache && Date.now() - rosterCache.fetchedAt < ROSTER_CACHE_MS) {
+    return rosterCache.data;
+  }
+  const resp = await fetch(`https://raw.githubusercontent.com/${INDEX_REPO_OWNER}/${INDEX_REPO_NAME}/HEAD/${INDEX_FILE_PATH}?t=${Date.now()}`);
+  if (!resp.ok) return null;
+  try {
+    const data = await resp.json() as CreatorRecord[];
+    rosterCache = { fetchedAt: Date.now(), data };
+    return data;
+  } catch { return null; }
+}
+
+async function fetchManifest(repoPath: string): Promise<{ content?: unknown[] } | null> {
+  const resp = await fetch(`https://raw.githubusercontent.com/${repoPath}/HEAD/.algorithmic-arts.json?t=${Date.now()}`);
+  if (!resp.ok) return null;
+  try { return await resp.json() as { content?: unknown[] }; }
+  catch { return null; }
+}
+
+async function findContentIssue(env: Env, owner: string, repo: string, label: string): Promise<number | null> {
+  const resp = await ghFetch(env, `https://api.github.com/repos/${owner}/${repo}/issues?labels=${encodeURIComponent(label)}&state=all&per_page=1`);
+  if (!resp.ok) return null;
+  const issues = await resp.json() as Array<{ number: number; pull_request?: unknown }>;
+  const notPr = issues.find((i) => !i.pull_request);
+  return notPr ? notPr.number : null;
+}
+
+async function createContentIssue(env: Env, owner: string, repo: string, contentSlug: string, title: string, creatorSlug: string): Promise<number> {
+  const url = `https://net.binary-blender.com/content?creator=${encodeURIComponent(creatorSlug)}&content=${encodeURIComponent(contentSlug)}`;
+  const resp = await ghFetch(env, `https://api.github.com/repos/${owner}/${repo}/issues`, {
+    method: "POST",
+    body: JSON.stringify({
+      title: `Comments — ${title.slice(0, 200)}`,
+      body:  `Comment thread for **${title}** at ${url}. Any comment posted there is added here as a reply, attributed to the Google user who posted it. Comment directly on GitHub if you prefer — same thread.`,
+      labels: ["comments", `content:${contentSlug}`],
+    }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`couldn't create content issue: HTTP ${resp.status} — ${text.slice(0, 300)}`);
+  }
+  const created = await resp.json() as { number: number };
+  return created.number;
+}
+
 // ─── Read path (unauthenticated) ────────────────────────────────────────────
 
 async function listComments(env: Env, url: URL): Promise<Response> {
-  const contentSlug = url.searchParams.get("content");
-  const issueParam  = url.searchParams.get("issue");
-  if (!contentSlug) return jsonError(400, "missing content parameter");
-  if (!issueParam)  return jsonError(400, "missing issue parameter");
-  const repoRef = REPO_ALLOWLIST[contentSlug];
-  if (!repoRef) return jsonError(403, `unknown content slug: ${contentSlug}`);
-  const issue = Number(issueParam);
-  if (!Number.isFinite(issue) || issue < 1) return jsonError(400, "issue must be a positive integer");
+  const target = await resolveFromUrl(env, url, /*createIfMissing*/ false);
+  if ("error" in target) return jsonError(target.status ?? 400, target.error);
+
+  // Community content with no issue yet — return an empty thread so the
+  // UI can render "no comments yet, be first" without a round trip that
+  // creates a stub issue on the creator's repo.
+  if (target.issue === null) {
+    return jsonOk({
+      thread: {
+        number: 0,
+        title:  target.contentTitle ?? "",
+        body:   "",
+        createdAt: "",
+        updatedAt: "",
+        repoOwner: target.owner,
+        repoName:  target.repo,
+        htmlUrl:   `https://github.com/${target.owner}/${target.repo}`,
+        replies:   [],
+      },
+    });
+  }
 
   const [issueResp, commentsResp] = await Promise.all([
-    ghFetch(env, `https://api.github.com/repos/${repoRef.owner}/${repoRef.repo}/issues/${issue}`),
-    ghFetch(env, `https://api.github.com/repos/${repoRef.owner}/${repoRef.repo}/issues/${issue}/comments?per_page=100`),
+    ghFetch(env, `https://api.github.com/repos/${target.owner}/${target.repo}/issues/${target.issue}`),
+    ghFetch(env, `https://api.github.com/repos/${target.owner}/${target.repo}/issues/${target.issue}/comments?per_page=100`),
   ]);
   if (!issueResp.ok)    return passUpstreamError(issueResp);
   if (!commentsResp.ok) return passUpstreamError(commentsResp);
@@ -376,9 +567,9 @@ async function listComments(env: Env, url: URL): Promise<Response> {
       body:   iss.body ?? "",
       createdAt: iss.created_at,
       updatedAt: iss.updated_at,
-      repoOwner: repoRef.owner,
-      repoName:  repoRef.repo,
-      htmlUrl:   `https://github.com/${repoRef.owner}/${repoRef.repo}/issues/${iss.number}`,
+      repoOwner: target.owner,
+      repoName:  target.repo,
+      htmlUrl:   `https://github.com/${target.owner}/${target.repo}/issues/${iss.number}`,
       replies:   comments.map((c) => ({
         id: c.id,
         body: c.body ?? "",
@@ -394,24 +585,20 @@ async function listComments(env: Env, url: URL): Promise<Response> {
 async function postComment(request: Request, env: Env): Promise<Response> {
   const payload = await parseJson(request);
   if (!payload) return jsonError(400, "invalid JSON body");
-  const { googleIdToken, content, issue, body } = payload as {
-    googleIdToken?: string; content?: string; issue?: number; body?: string;
-  };
+  const { googleIdToken, body } = payload as { googleIdToken?: string; body?: string };
   if (typeof googleIdToken !== "string") return jsonError(400, "missing googleIdToken");
-  if (typeof content !== "string")       return jsonError(400, "missing content");
-  if (typeof issue !== "number")         return jsonError(400, "missing issue");
   if (typeof body !== "string" || body.trim().length === 0) return jsonError(400, "missing body");
-  if (body.length > 5000)                return jsonError(413, "comment too long (max 5000)");
-
-  const repoRef = REPO_ALLOWLIST[content];
-  if (!repoRef) return jsonError(403, `unknown content slug: ${content}`);
+  if (body.length > 5000) return jsonError(413, "comment too long (max 5000)");
 
   const identity = await verifyGoogleToken(googleIdToken, env);
   if (!identity) return jsonError(401, "invalid or expired Google token");
 
-  const commentBody = attributedBody(identity, body);
+  const target = await resolveFromBody(env, payload as Record<string, unknown>, /*createIfMissing*/ true);
+  if ("error" in target) return jsonError(target.status ?? 400, target.error);
+  if (target.issue === null) return jsonError(500, "issue resolution failed");
 
-  const ghResp = await ghFetch(env, `https://api.github.com/repos/${repoRef.owner}/${repoRef.repo}/issues/${issue}/comments`, {
+  const commentBody = attributedBody(identity, body);
+  const ghResp = await ghFetch(env, `https://api.github.com/repos/${target.owner}/${target.repo}/issues/${target.issue}/comments`, {
     method: "POST",
     body: JSON.stringify({ body: commentBody }),
   });
@@ -422,6 +609,7 @@ async function postComment(request: Request, env: Env): Promise<Response> {
     htmlUrl: created.html_url,
     createdAt: created.created_at,
     body: created.body,
+    issue: target.issue,
   });
 }
 
