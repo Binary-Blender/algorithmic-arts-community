@@ -152,10 +152,19 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
 // newest-last naturally, and we can slice to newest-first without an
 // extra sort. Random suffix disambiguates same-ms creations.
 
+// Link target: either a native Net content (creator+content) or an external URL.
+interface NativeTarget   { creator: string; content: string; }
+interface ExternalTarget { external: { url: string; title?: string; sourceName?: string; }; }
+type LinkTarget = NativeTarget | ExternalTarget;
+
+function isExternalTarget(t: LinkTarget): t is ExternalTarget {
+  return typeof (t as ExternalTarget).external === "object" && (t as ExternalTarget).external !== null;
+}
+
 interface LinkRecord {
   id: string;
-  from: { creator: string; content: string };
-  to:   { creator: string; content: string };
+  from: NativeTarget;        // MVP: source is always native
+  to:   LinkTarget;          // Target may be native OR external
   note: string;
   sub:  string;
   email: string;
@@ -204,27 +213,44 @@ async function createLink(request: Request, env: Env): Promise<Response> {
   const p = payload as {
     googleIdToken?: string;
     from?: { creator?: string; content?: string };
-    to?:   { creator?: string; content?: string };
+    to?:   { creator?: string; content?: string; external?: { url?: string; title?: string; sourceName?: string } };
     note?: string;
   };
   if (typeof p.googleIdToken !== "string") return jsonError(400, "missing googleIdToken");
   if (!p.from || typeof p.from.creator !== "string" || typeof p.from.content !== "string") return jsonError(400, "missing/invalid 'from' target");
-  if (!p.to   || typeof p.to.creator   !== "string" || typeof p.to.content   !== "string") return jsonError(400, "missing/invalid 'to' target");
   const note = typeof p.note === "string" ? p.note.trim().slice(0, 500) : "";
-  if (p.from.creator === p.to.creator && p.from.content === p.to.content) {
-    return jsonError(400, "can't link a content to itself");
-  }
 
   const identity = await verifyGoogleToken(p.googleIdToken, env);
   if (!identity) return jsonError(401, "invalid or expired Google token");
 
-  // Validate both endpoints — must be community content items on the platform
+  // Validate source — always native
   const fromV = await validateCommunityTarget(p.from.creator, p.from.content);
   if ("error" in fromV) return jsonError(fromV.status ?? 400, `from: ${fromV.error}`);
-  const toV = await validateCommunityTarget(p.to.creator, p.to.content);
-  if ("error" in toV)   return jsonError(toV.status   ?? 400, `to: ${toV.error}`);
 
-  // Duplicate check: same author, same from, same to → 409
+  // Detect target shape — native (creator+content) or external ({url})
+  let toResolved: LinkTarget;
+  if (p.to && p.to.external && typeof p.to.external.url === "string") {
+    // External target
+    const raw = p.to.external.url.trim();
+    let parsed: URL;
+    try { parsed = new URL(raw); } catch { return jsonError(400, "to.external.url is not a valid URL"); }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return jsonError(400, "to.external.url must be http/https");
+    const title      = typeof p.to.external.title      === "string" ? p.to.external.title.trim().slice(0, 200)      : "";
+    const sourceName = typeof p.to.external.sourceName === "string" ? p.to.external.sourceName.trim().slice(0, 100) : "";
+    toResolved = { external: { url: raw, ...(title ? { title } : {}), ...(sourceName ? { sourceName } : {}) } };
+  } else if (p.to && typeof p.to.creator === "string" && typeof p.to.content === "string") {
+    // Native target — validate
+    if (p.from.creator === p.to.creator && p.from.content === p.to.content) {
+      return jsonError(400, "can't link a content to itself");
+    }
+    const toV = await validateCommunityTarget(p.to.creator, p.to.content);
+    if ("error" in toV) return jsonError(toV.status ?? 400, `to: ${toV.error}`);
+    toResolved = { creator: p.to.creator, content: p.to.content };
+  } else {
+    return jsonError(400, "missing/invalid 'to' target — provide {creator, content} for native or {external:{url}} for external");
+  }
+
+  // Duplicate check: same author, same from, same normalized to → 409
   const outPrefix = `linkout:${p.from.creator}/${p.from.content}:`;
   const existing = await env.AA_LINKS.list({ prefix: outPrefix, limit: 500 });
   for (const key of existing.keys) {
@@ -233,10 +259,12 @@ async function createLink(request: Request, env: Env): Promise<Response> {
     if (!rec) continue;
     try {
       const r = JSON.parse(rec) as LinkRecord;
-      if (r.sub === identity.sub &&
-          r.to.creator === p.to.creator && r.to.content === p.to.content) {
-        return jsonError(409, "you already created this link");
-      }
+      if (r.sub !== identity.sub) continue;
+      const same = isExternalTarget(toResolved) && isExternalTarget(r.to)
+        ? r.to.external.url === toResolved.external.url
+        : !isExternalTarget(toResolved) && !isExternalTarget(r.to)
+          && r.to.creator === toResolved.creator && r.to.content === toResolved.content;
+      if (same) return jsonError(409, "you already created this link");
     } catch { /* ignore */ }
   }
 
@@ -244,7 +272,7 @@ async function createLink(request: Request, env: Env): Promise<Response> {
   const record: LinkRecord = {
     id,
     from: { creator: p.from.creator, content: p.from.content },
-    to:   { creator: p.to.creator,   content: p.to.content   },
+    to:   toResolved,
     note,
     sub:   identity.sub,
     email: identity.email,
@@ -253,7 +281,11 @@ async function createLink(request: Request, env: Env): Promise<Response> {
   };
   await env.AA_LINKS.put(`link:${id}`, JSON.stringify(record));
   await env.AA_LINKS.put(`linkout:${p.from.creator}/${p.from.content}:${id}`, id);
-  await env.AA_LINKS.put(`linkin:${p.to.creator}/${p.to.content}:${id}`, id);
+  // Reverse index only for native targets — external URLs have unbounded
+  // namespace and no meaningful reverse query.
+  if (!isExternalTarget(toResolved)) {
+    await env.AA_LINKS.put(`linkin:${toResolved.creator}/${toResolved.content}:${id}`, id);
+  }
   return jsonOk({ link: {
     id, from: record.from, to: record.to, note, createdAt: record.createdAt,
     author: { name: identity.name, subHash: identity.sub.slice(-8) },
@@ -277,7 +309,10 @@ async function deleteLink(request: Request, env: Env, linkId: string): Promise<R
 
   await env.AA_LINKS.delete(`link:${linkId}`);
   await env.AA_LINKS.delete(`linkout:${record.from.creator}/${record.from.content}:${linkId}`);
-  await env.AA_LINKS.delete(`linkin:${record.to.creator}/${record.to.content}:${linkId}`);
+  // Reverse index only exists for native targets — external targets skipped this on create.
+  if (!isExternalTarget(record.to)) {
+    await env.AA_LINKS.delete(`linkin:${record.to.creator}/${record.to.content}:${linkId}`);
+  }
   return jsonOk({ deleted: linkId });
 }
 
