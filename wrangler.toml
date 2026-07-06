@@ -24,3 +24,11 @@ id = "a5fa1aea07ce43a5a2774fd8a9fd7ab0"
 [[kv_namespaces]]
 binding = "AA_LINKS"
 id = "b97dd4fda6ee4a249ceccf086f92f5ca"
+
+# KV — cached responses from external content sources (RSS / YouTube /
+# Spotify / etc.). Values are the normalized JSON returned to the client.
+# expirationTtl set per fetch — 15 min for RSS, 15 min for YouTube.
+# Key format: <type>:<canonical-id>  e.g. rss:https://blog.example.com/feed
+[[kv_namespaces]]
+binding = "AA_EXTERNAL"
+id = "00db597bb219462ab6fe04661727f723"

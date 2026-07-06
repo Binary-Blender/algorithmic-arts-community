@@ -19,12 +19,15 @@ interface Env {
   AA_LIKES: KVNamespace;
   /** KV: user-authored links between content items ("this reminded me of…"). */
   AA_LINKS: KVNamespace;
+  /** KV: cached responses from external content sources (RSS / YouTube / etc.). */
+  AA_EXTERNAL: KVNamespace;
 }
 
 const COMMENTS_PREFIX = "/api/comments";
 const LIKES_PREFIX    = "/api/likes";
 const REGISTER_PREFIX = "/api/register";
 const LINKS_PREFIX    = "/api/links";
+const EXTERNAL_PREFIX = "/api/external";
 
 const INDEX_REPO_OWNER = "Binary-Blender";
 const INDEX_REPO_NAME  = "algorithmic-arts-index";
@@ -65,7 +68,8 @@ export default {
     const isLikes    = url.pathname.startsWith(LIKES_PREFIX);
     const isRegister = url.pathname.startsWith(REGISTER_PREFIX);
     const isLinks    = url.pathname.startsWith(LINKS_PREFIX);
-    if (!isComments && !isLikes && !isRegister && !isLinks) {
+    const isExternal = url.pathname.startsWith(EXTERNAL_PREFIX);
+    if (!isComments && !isLikes && !isRegister && !isLinks && !isExternal) {
       return new Response("not found", { status: 404 });
     }
 
@@ -108,6 +112,12 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
     const suffix = url.pathname.slice(REGISTER_PREFIX.length);
     if (request.method === "POST" && suffix === "") return registerCreator(request, env);
     return jsonError(404, `no route: ${request.method} /api/register${suffix}`);
+  }
+  // ── /api/external ───────────────────────────────────────────────
+  if (url.pathname.startsWith(EXTERNAL_PREFIX)) {
+    const suffix = url.pathname.slice(EXTERNAL_PREFIX.length);
+    if (request.method === "GET" && suffix === "") return getExternal(env, url);
+    return jsonError(404, `no route: ${request.method} /api/external${suffix}`);
   }
   // ── /api/links ──────────────────────────────────────────────────
   if (url.pathname.startsWith(LINKS_PREFIX)) {
@@ -769,6 +779,233 @@ async function postComment(request: Request, env: Env): Promise<Response> {
     body: created.body,
     issue: target.issue,
   });
+}
+
+// ─── External content sources (RSS / YouTube / etc.) ───────────────────────
+//
+// Aggregates content from platforms the creator's already on. Fetched
+// server-side (bypasses CORS, hides API keys, caches aggressively) and
+// returned in a normalized shape the frontend renders type-agnostic.
+//
+// Normalized shape:
+//   {
+//     type: "rss" | "youtube-channel" | "spotify-artist",
+//     sourceName: "…",              — human-readable name of the feed/channel
+//     sourceUrl:  "…",              — canonical link back to the source
+//     items: [
+//       { title, url, publishedAt, thumbnail?, description? }
+//     ]
+//   }
+//
+// Cache: keyed by type + source id. TTL 15 min via KV expirationTtl.
+
+interface NormalizedExternal {
+  type: string;
+  sourceName: string;
+  sourceUrl: string;
+  items: Array<{
+    title: string;
+    url: string;
+    publishedAt: string;
+    thumbnail?: string;
+    description?: string;
+  }>;
+}
+
+async function getExternal(env: Env, url: URL): Promise<Response> {
+  const type = url.searchParams.get("type");
+  if (type === "rss") return getRssFeed(env, url);
+  return jsonError(400, `unsupported type "${type}" — supported: rss`);
+}
+
+async function getRssFeed(env: Env, url: URL): Promise<Response> {
+  const feedUrl = url.searchParams.get("url");
+  if (!feedUrl) return jsonError(400, "url parameter required");
+  let parsed: URL;
+  try { parsed = new URL(feedUrl); } catch { return jsonError(400, "url is not a valid URL"); }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return jsonError(400, "url must be http or https");
+  }
+
+  const cacheKey = `rss:${feedUrl}`;
+  const cached = await env.AA_EXTERNAL.get(cacheKey);
+  if (cached) {
+    try { return jsonOk(JSON.parse(cached)); }
+    catch { /* fall through to refetch */ }
+  }
+
+  const resp = await fetch(feedUrl, {
+    headers: {
+      "User-Agent": "net.binary-blender.com feed aggregator",
+      "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+    },
+    cf: { cacheTtl: 60 },
+  });
+  if (!resp.ok) return jsonError(resp.status, `feed fetch failed: HTTP ${resp.status}`);
+  const xml = await resp.text();
+  const normalized = parseFeed(xml, feedUrl);
+  await env.AA_EXTERNAL.put(cacheKey, JSON.stringify(normalized), { expirationTtl: 900 });
+  return jsonOk(normalized);
+}
+
+// ── Feed parser — handles RSS 2.0 and Atom ──────────────────────────────────
+// Uses regex extraction rather than DOM parsing. Works because feeds are
+// well-defined enough that greedy nesting isn't a real problem; the trade-off
+// is that we won't handle deeply malformed feeds. Acceptable for a public
+// aggregator — malformed feeds surface as no-items rather than crashes.
+
+function parseFeed(xml: string, sourceUrl: string): NormalizedExternal {
+  const isAtom = /<feed\b[^>]*xmlns=["']http:\/\/www\.w3\.org\/2005\/Atom["']/.test(xml) ||
+                 /<feed\b[^>]*>/.test(xml) && !/<rss\b/.test(xml);
+
+  if (isAtom) return parseAtom(xml, sourceUrl);
+  return parseRss20(xml, sourceUrl);
+}
+
+function parseRss20(xml: string, sourceUrl: string): NormalizedExternal {
+  const channelMatch = xml.match(/<channel\b[^>]*>([\s\S]*?)<\/channel>/i);
+  const channelBody = channelMatch ? channelMatch[1] : xml;
+
+  const feedTitle = firstTag(channelBody.replace(/<item\b[\s\S]*/i, ""), "title") || sourceUrl;
+  const feedLink  = firstTag(channelBody.replace(/<item\b[\s\S]*/i, ""), "link")  || sourceUrl;
+
+  const items: NormalizedExternal["items"] = [];
+  const itemRegex = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = itemRegex.exec(xml)) !== null) {
+    const body = m[1];
+    const title = firstTag(body, "title");
+    const link  = firstTag(body, "link");
+    const desc  = firstTag(body, "description");
+    const pub   = firstTag(body, "pubDate") || firstTag(body, "dc:date");
+    const thumb = extractThumbnail(body);
+    if (!title || !link) continue;
+    items.push({
+      title:       decodeEntities(title.trim()),
+      url:         decodeEntities(link.trim()),
+      publishedAt: normalizeDate(pub),
+      ...(desc  ? { description: htmlToText(desc).slice(0, 240) } : {}),
+      ...(thumb ? { thumbnail: thumb } : {}),
+    });
+    if (items.length >= 20) break;
+  }
+  return {
+    type: "rss",
+    sourceName: decodeEntities(feedTitle.trim()),
+    sourceUrl:  decodeEntities(feedLink.trim()) || sourceUrl,
+    items,
+  };
+}
+
+function parseAtom(xml: string, sourceUrl: string): NormalizedExternal {
+  const feedHead = xml.replace(/<entry\b[\s\S]*/i, "");
+  const feedTitle = firstTag(feedHead, "title") || sourceUrl;
+  // Atom <link href="…" rel="alternate" /> — pick the first alternate-or-plain
+  const feedLinkMatch = feedHead.match(/<link\b([^>]*)\/?>/i);
+  const feedLinkAttr  = feedLinkMatch ? feedLinkMatch[1] : "";
+  const feedLink = attr(feedLinkAttr, "href") || sourceUrl;
+
+  const items: NormalizedExternal["items"] = [];
+  const entryRegex = /<entry\b[^>]*>([\s\S]*?)<\/entry>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = entryRegex.exec(xml)) !== null) {
+    const body = m[1];
+    const title = firstTag(body, "title");
+    // In Atom, <link href="…" /> is common; sometimes multiple <link> — take the alternate or first
+    const linkMatches = [...body.matchAll(/<link\b([^>]*)\/?>/gi)];
+    let link = "";
+    for (const lm of linkMatches) {
+      const attrs = lm[1];
+      const rel = attr(attrs, "rel") || "alternate";
+      const href = attr(attrs, "href");
+      if (href && rel === "alternate") { link = href; break; }
+      if (href && !link) link = href;
+    }
+    if (!link) link = firstTag(body, "link");   // some feeds do text link
+    const summary = firstTag(body, "summary") || firstTag(body, "content");
+    const pub = firstTag(body, "published") || firstTag(body, "updated");
+    const thumb = extractThumbnail(body);
+    if (!title || !link) continue;
+    items.push({
+      title:       decodeEntities(title.trim()),
+      url:         decodeEntities(link.trim()),
+      publishedAt: normalizeDate(pub),
+      ...(summary ? { description: htmlToText(summary).slice(0, 240) } : {}),
+      ...(thumb   ? { thumbnail: thumb } : {}),
+    });
+    if (items.length >= 20) break;
+  }
+  return {
+    type: "rss",   // atom is still rendered as feed-shape for the UI
+    sourceName: decodeEntities(feedTitle.trim()),
+    sourceUrl:  decodeEntities(feedLink.trim()) || sourceUrl,
+    items,
+  };
+}
+
+function firstTag(xml: string, tag: string): string {
+  const re = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
+  const m = xml.match(re);
+  if (!m) return "";
+  return m[1].replace(/^<!\[CDATA\[|\]\]>$/g, "").trim();
+}
+
+function attr(attrs: string, name: string): string {
+  const m = attrs.match(new RegExp(`\\b${name}=["']([^"']*)["']`, "i"));
+  return m ? m[1] : "";
+}
+
+function extractThumbnail(itemBody: string): string {
+  // media:thumbnail / media:content
+  const mediaThumb = itemBody.match(/<media:thumbnail\b([^>]*)\/?>/i);
+  if (mediaThumb) {
+    const url = attr(mediaThumb[1], "url");
+    if (url) return url;
+  }
+  const mediaContent = itemBody.match(/<media:content\b([^>]*)\/?>/i);
+  if (mediaContent) {
+    const url = attr(mediaContent[1], "url");
+    if (url) return url;
+  }
+  // enclosure with image type
+  const enclosure = itemBody.match(/<enclosure\b([^>]*)\/?>/i);
+  if (enclosure) {
+    const url = attr(enclosure[1], "url");
+    const type = attr(enclosure[1], "type");
+    if (url && (!type || type.startsWith("image/"))) return url;
+  }
+  // First <img src=""> in description/content
+  const imgMatch = itemBody.match(/<img\b[^>]*src=["']([^"']+)["']/i);
+  if (imgMatch) return imgMatch[1];
+  return "";
+}
+
+function htmlToText(html: string): string {
+  return decodeEntities(html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
+}
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;/g,  "&")
+    .replace(/&lt;/g,   "<")
+    .replace(/&gt;/g,   ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g,  "'")
+    .replace(/&#8217;/g, "'")
+    .replace(/&#8216;/g, "'")
+    .replace(/&#8220;/g, "\"")
+    .replace(/&#8221;/g, "\"")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)));
+}
+
+function normalizeDate(raw: string): string {
+  if (!raw) return "";
+  const trimmed = raw.trim();
+  const d = new Date(trimmed);
+  if (isNaN(d.getTime())) return trimmed;   // preserve if unparseable
+  return d.toISOString();
 }
 
 // ─── Google JWT verification ────────────────────────────────────────────────
