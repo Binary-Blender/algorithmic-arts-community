@@ -21,6 +21,11 @@ interface Env {
   AA_LINKS: KVNamespace;
   /** KV: cached responses from external content sources (RSS / YouTube / etc.). */
   AA_EXTERNAL: KVNamespace;
+  /** Optional: YouTube Data API v3 key. If unset, /api/external?type=youtube-channel returns 503. */
+  YOUTUBE_API_KEY?: string;
+  /** Optional: Spotify Developer app credentials for Client Credentials flow. */
+  SPOTIFY_CLIENT_ID?: string;
+  SPOTIFY_CLIENT_SECRET?: string;
 }
 
 const COMMENTS_PREFIX = "/api/comments";
@@ -814,8 +819,11 @@ interface NormalizedExternal {
 
 async function getExternal(env: Env, url: URL): Promise<Response> {
   const type = url.searchParams.get("type");
-  if (type === "rss") return getRssFeed(env, url);
-  return jsonError(400, `unsupported type "${type}" — supported: rss`);
+  if (type === "rss")              return getRssFeed(env, url);
+  if (type === "bluesky")          return getBlueskyFeed(env, url);
+  if (type === "youtube-channel")  return getYoutubeChannel(env, url);
+  if (type === "spotify-artist")   return getSpotifyArtist(env, url);
+  return jsonError(400, `unsupported type "${type}" — supported: rss, bluesky, youtube-channel, spotify-artist`);
 }
 
 async function getRssFeed(env: Env, url: URL): Promise<Response> {
@@ -844,6 +852,208 @@ async function getRssFeed(env: Env, url: URL): Promise<Response> {
   if (!resp.ok) return jsonError(resp.status, `feed fetch failed: HTTP ${resp.status}`);
   const xml = await resp.text();
   const normalized = parseFeed(xml, feedUrl);
+  await env.AA_EXTERNAL.put(cacheKey, JSON.stringify(normalized), { expirationTtl: 900 });
+  return jsonOk(normalized);
+}
+
+// ── Bluesky (AT Protocol public API) ────────────────────────────────────────
+// No auth required for reads. Endpoint: app.bsky.feed.getAuthorFeed with an
+// actor handle. Feed items are posts; we normalize the first 200 chars of
+// post.record.text as the "title" since Bluesky posts don't have titles.
+
+async function getBlueskyFeed(env: Env, url: URL): Promise<Response> {
+  const handle = url.searchParams.get("handle");
+  if (!handle) return jsonError(400, "handle parameter required");
+  const cleanHandle = handle.replace(/^@/, "").trim().toLowerCase();
+
+  const cacheKey = `bluesky:${cleanHandle}`;
+  const cached = await env.AA_EXTERNAL.get(cacheKey);
+  if (cached) { try { return jsonOk(JSON.parse(cached)); } catch { /* refetch */ } }
+
+  const apiUrl = `https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed?actor=${encodeURIComponent(cleanHandle)}&limit=20`;
+  const resp = await fetch(apiUrl, { headers: { "Accept": "application/json" } });
+  if (!resp.ok) return jsonError(resp.status, `Bluesky fetch failed: HTTP ${resp.status}`);
+  interface BskyEntry {
+    post: {
+      uri: string;
+      indexedAt: string;
+      record?: { text?: string; createdAt?: string };
+      embed?: {
+        images?: Array<{ thumb?: string; fullsize?: string; alt?: string }>;
+        media?:  { images?: Array<{ thumb?: string; fullsize?: string }> };
+        external?: { thumb?: string; title?: string; description?: string };
+      };
+      author?: { handle?: string; displayName?: string };
+    };
+  }
+  const data = await resp.json() as { feed?: BskyEntry[] };
+
+  const items: NormalizedExternal["items"] = (data.feed || [])
+    .filter((e) => e.post && e.post.uri)
+    .map((e) => {
+      const post = e.post;
+      const rkey = post.uri.split("/").pop() ?? "";
+      const webUrl = `https://bsky.app/profile/${cleanHandle}/post/${rkey}`;
+      const text = (post.record?.text ?? "").trim();
+      const title = text ? text.slice(0, 140) + (text.length > 140 ? "…" : "") : "(post without text)";
+      const thumb =
+        post.embed?.images?.[0]?.thumb ??
+        post.embed?.media?.images?.[0]?.thumb ??
+        post.embed?.external?.thumb ??
+        "";
+      const description = text.length > 140 ? text : "";
+      return {
+        title,
+        url: webUrl,
+        publishedAt: normalizeDate(post.record?.createdAt ?? post.indexedAt ?? ""),
+        ...(thumb        ? { thumbnail: thumb } : {}),
+        ...(description  ? { description: description.slice(0, 240) } : {}),
+      };
+    })
+    .slice(0, 20);
+
+  // Try to pull the display name from the first post's author
+  const displayName = (data.feed?.[0]?.post?.author?.displayName || cleanHandle);
+  const normalized: NormalizedExternal = {
+    type: "bluesky",
+    sourceName: displayName,
+    sourceUrl: `https://bsky.app/profile/${cleanHandle}`,
+    items,
+  };
+  await env.AA_EXTERNAL.put(cacheKey, JSON.stringify(normalized), { expirationTtl: 900 });
+  return jsonOk(normalized);
+}
+
+// ── YouTube channel (Data API v3) ───────────────────────────────────────────
+// Requires a YouTube API key in worker secrets. If unset, this route returns
+// 503 with a clear message. Quota cost per listing: ~100 units. Free tier is
+// 10 K/day; combined with a 15-min KV cache, hundreds of channels fit.
+
+async function getYoutubeChannel(env: Env, url: URL): Promise<Response> {
+  const channelId = url.searchParams.get("id");
+  if (!channelId) return jsonError(400, "id parameter required (YouTube channel ID, e.g. UCxxxxxxxxxxxxxxxxxxxxxx)");
+  if (!env.YOUTUBE_API_KEY) return jsonError(503, "YouTube support is not configured on this deployment (missing YOUTUBE_API_KEY)");
+
+  const cacheKey = `youtube-channel:${channelId}`;
+  const cached = await env.AA_EXTERNAL.get(cacheKey);
+  if (cached) { try { return jsonOk(JSON.parse(cached)); } catch { /* refetch */ } }
+
+  const apiUrl =
+    `https://www.googleapis.com/youtube/v3/search` +
+    `?part=snippet&channelId=${encodeURIComponent(channelId)}` +
+    `&order=date&maxResults=20&type=video&key=${encodeURIComponent(env.YOUTUBE_API_KEY)}`;
+  const resp = await fetch(apiUrl, { headers: { "Accept": "application/json" } });
+  if (!resp.ok) {
+    const text = await resp.text();
+    return jsonError(resp.status, `YouTube fetch failed: HTTP ${resp.status} — ${text.slice(0, 300)}`);
+  }
+  interface YtItem {
+    id: { videoId?: string };
+    snippet: {
+      title: string;
+      description?: string;
+      publishedAt: string;
+      channelTitle?: string;
+      thumbnails?: { default?: { url: string }; medium?: { url: string }; high?: { url: string } };
+    };
+  }
+  const data = await resp.json() as { items?: YtItem[] };
+
+  const items: NormalizedExternal["items"] = (data.items || [])
+    .filter((i) => i.id.videoId)
+    .map((i) => ({
+      title: i.snippet.title,
+      url:   `https://youtube.com/watch?v=${i.id.videoId}`,
+      publishedAt: normalizeDate(i.snippet.publishedAt),
+      ...(i.snippet.thumbnails?.medium?.url ? { thumbnail: i.snippet.thumbnails.medium.url } : {}),
+      ...(i.snippet.description ? { description: htmlToText(i.snippet.description).slice(0, 240) } : {}),
+    }))
+    .slice(0, 20);
+
+  const channelName = data.items?.[0]?.snippet?.channelTitle || channelId;
+  const normalized: NormalizedExternal = {
+    type: "youtube-channel",
+    sourceName: channelName,
+    sourceUrl: `https://youtube.com/channel/${channelId}`,
+    items,
+  };
+  await env.AA_EXTERNAL.put(cacheKey, JSON.stringify(normalized), { expirationTtl: 900 });
+  return jsonOk(normalized);
+}
+
+// ── Spotify artist (Client Credentials flow) ────────────────────────────────
+// Needs a Spotify Developer app registered; client ID + secret in worker
+// secrets. Client credentials flow gets a bearer token for public data
+// (albums, top tracks, artist metadata). Token is ~1h; cached in KV.
+
+async function getSpotifyToken(env: Env): Promise<string | null> {
+  if (!env.SPOTIFY_CLIENT_ID || !env.SPOTIFY_CLIENT_SECRET) return null;
+  const cached = await env.AA_EXTERNAL.get("spotify:token");
+  if (cached) return cached;
+  const basic = btoa(`${env.SPOTIFY_CLIENT_ID}:${env.SPOTIFY_CLIENT_SECRET}`);
+  const resp = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      "Authorization": `Basic ${basic}`,
+      "Content-Type":  "application/x-www-form-urlencoded",
+    },
+    body: "grant_type=client_credentials",
+  });
+  if (!resp.ok) return null;
+  const data = await resp.json() as { access_token: string; expires_in: number };
+  await env.AA_EXTERNAL.put("spotify:token", data.access_token, {
+    expirationTtl: Math.max(60, data.expires_in - 60),  // refresh 1 min before real expiry
+  });
+  return data.access_token;
+}
+
+async function getSpotifyArtist(env: Env, url: URL): Promise<Response> {
+  const artistId = url.searchParams.get("id");
+  if (!artistId) return jsonError(400, "id parameter required (Spotify artist ID)");
+  if (!env.SPOTIFY_CLIENT_ID || !env.SPOTIFY_CLIENT_SECRET) {
+    return jsonError(503, "Spotify support is not configured on this deployment (missing SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET)");
+  }
+
+  const cacheKey = `spotify-artist:${artistId}`;
+  const cached = await env.AA_EXTERNAL.get(cacheKey);
+  if (cached) { try { return jsonOk(JSON.parse(cached)); } catch { /* refetch */ } }
+
+  const token = await getSpotifyToken(env);
+  if (!token) return jsonError(502, "couldn't obtain Spotify access token");
+
+  const authH = { "Authorization": `Bearer ${token}`, "Accept": "application/json" };
+  const [artistResp, albumsResp] = await Promise.all([
+    fetch(`https://api.spotify.com/v1/artists/${encodeURIComponent(artistId)}`, { headers: authH }),
+    fetch(`https://api.spotify.com/v1/artists/${encodeURIComponent(artistId)}/albums?limit=20&include_groups=album,single`, { headers: authH }),
+  ]);
+  if (!artistResp.ok) return jsonError(artistResp.status, `Spotify artist fetch failed: HTTP ${artistResp.status}`);
+  if (!albumsResp.ok) return jsonError(albumsResp.status, `Spotify albums fetch failed: HTTP ${albumsResp.status}`);
+  interface SpArtist { name: string; external_urls?: { spotify?: string }; images?: Array<{ url: string }>; }
+  interface SpAlbum {
+    name: string;
+    album_type: string;
+    total_tracks: number;
+    release_date: string;
+    external_urls?: { spotify?: string };
+    images?: Array<{ url: string }>;
+  }
+  const artist = await artistResp.json() as SpArtist;
+  const albums = await albumsResp.json() as { items?: SpAlbum[] };
+
+  const items: NormalizedExternal["items"] = (albums.items || []).map((a) => ({
+    title: a.name,
+    url:   a.external_urls?.spotify || `https://open.spotify.com/artist/${artistId}`,
+    publishedAt: normalizeDate(a.release_date),
+    ...(a.images?.[0]?.url ? { thumbnail: a.images[0].url } : {}),
+    description: `${a.album_type} · ${a.total_tracks} track${a.total_tracks === 1 ? "" : "s"}`,
+  }));
+
+  const normalized: NormalizedExternal = {
+    type: "spotify-artist",
+    sourceName: artist.name,
+    sourceUrl:  artist.external_urls?.spotify || `https://open.spotify.com/artist/${artistId}`,
+    items,
+  };
   await env.AA_EXTERNAL.put(cacheKey, JSON.stringify(normalized), { expirationTtl: 900 });
   return jsonOk(normalized);
 }
