@@ -1382,6 +1382,21 @@ interface Post {
   syndications: Array<{ platform: string; url: string }>;  // where copies landed
 }
 
+// Resolve a stream key to its repo — either an imprint allowlist key, or a
+// roster creator's slug (their own registered repo). Roster resolution is what
+// lets any registered creator publish to their own soil, not just the imprint.
+async function resolveStream(key: string): Promise<{ owner: string; repo: string; creator: CreatorRecord | null } | null> {
+  const allow = REPO_ALLOWLIST[key];
+  if (allow) return { owner: allow.owner, repo: allow.repo, creator: null };
+  const roster = await fetchRoster();
+  const rec = roster?.find((c) => c.slug === key) ?? null;
+  if (rec && typeof rec.repo === "string" && REPO_RE.test(rec.repo)) {
+    const [owner, repo] = rec.repo.split("/");
+    return { owner, repo, creator: rec };
+  }
+  return null;
+}
+
 async function publishPost(request: Request, env: Env): Promise<Response> {
   const payload = await parseJson(request);
   if (!payload) return jsonError(400, "invalid JSON body");
@@ -1390,16 +1405,21 @@ async function publishPost(request: Request, env: Env): Promise<Response> {
     media?: unknown; syndicate?: unknown;
   };
   if (typeof googleIdToken !== "string") return jsonError(400, "missing googleIdToken");
-  if (typeof content !== "string" || !REPO_ALLOWLIST[content]) {
-    return jsonError(400, `unknown content stream "${content ?? ""}"`);
-  }
+  if (typeof content !== "string" || content.length === 0) return jsonError(400, "missing content stream");
   if (typeof text !== "string" || text.trim().length === 0) return jsonError(400, "missing text");
   if (text.length > 10000) return jsonError(413, "post too long (max 10000)");
 
   const identity = await verifyGoogleToken(googleIdToken, env);
   if (!identity) return jsonError(401, "invalid or expired Google token");
 
-  const { owner, repo } = REPO_ALLOWLIST[content];
+  const stream = await resolveStream(content);
+  if (!stream) return jsonError(400, `unknown content stream "${content}"`);
+  // A roster creator may only post to their own registered stream; the imprint
+  // allowlist streams stay open to the imprint's signed-in operators.
+  if (stream.creator && stream.creator.registeredBy !== identity.email) {
+    return jsonError(403, `"${content}" isn't yours to post to`);
+  }
+  const { owner, repo } = stream;
   const mediaUrls = Array.isArray(media)
     ? media.filter((m): m is string => typeof m === "string").slice(0, 8) : undefined;
   const targets = Array.isArray(syndicate)
@@ -1512,10 +1532,10 @@ async function publishToBluesky(env: Env, text: string, link: string): Promise<s
 async function getFeed(_env: Env, url: URL): Promise<Response> {
   const content = url.searchParams.get("content") ?? "";
   const format = (url.searchParams.get("format") ?? "rss").toLowerCase();
-  const entry = REPO_ALLOWLIST[content];
-  if (!entry) return jsonError(400, `unknown content stream "${content}"`);
+  const stream = await resolveStream(content);
+  if (!stream) return jsonError(400, `unknown content stream "${content}"`);
 
-  const rawUrl = `https://raw.githubusercontent.com/${entry.owner}/${entry.repo}/HEAD/${POSTS_FILE_PATH}`;
+  const rawUrl = `https://raw.githubusercontent.com/${stream.owner}/${stream.repo}/HEAD/${POSTS_FILE_PATH}`;
   const resp = await fetch(rawUrl);
   let posts: Post[] = [];
   if (resp.ok) { try { posts = await resp.json() as Post[]; } catch { posts = []; } }
