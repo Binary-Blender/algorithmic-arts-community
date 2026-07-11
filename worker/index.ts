@@ -26,6 +26,9 @@ interface Env {
   /** Optional: Spotify Developer app credentials for Client Credentials flow. */
   SPOTIFY_CLIENT_ID?: string;
   SPOTIFY_CLIENT_SECRET?: string;
+  /** Optional: the imprint's Bluesky handle + app password for outbound (POSSE) syndication. */
+  BLUESKY_HANDLE?: string;
+  BLUESKY_APP_PASSWORD?: string;
 }
 
 const COMMENTS_PREFIX = "/api/comments";
@@ -33,6 +36,14 @@ const LIKES_PREFIX    = "/api/likes";
 const REGISTER_PREFIX = "/api/register";
 const LINKS_PREFIX    = "/api/links";
 const EXTERNAL_PREFIX = "/api/external";
+const PUBLISH_PREFIX  = "/api/publish";
+const FEED_PREFIX     = "/api/feed";
+
+// Owned posts (POSSE origin) live in posts.json at the root of the content repo —
+// git-as-database, same shape as creators.json. The canonical URL of every post
+// points back to the owned site; the silos only ever get syndicated copies.
+const POSTS_FILE_PATH = "posts.json";
+const SITE_BASE       = "https://algorithmic-arts.binary-blender.com";
 
 const INDEX_REPO_OWNER = "Binary-Blender";
 const INDEX_REPO_NAME  = "algorithmic-arts-index";
@@ -74,7 +85,9 @@ export default {
     const isRegister = url.pathname.startsWith(REGISTER_PREFIX);
     const isLinks    = url.pathname.startsWith(LINKS_PREFIX);
     const isExternal = url.pathname.startsWith(EXTERNAL_PREFIX);
-    if (!isComments && !isLikes && !isRegister && !isLinks && !isExternal) {
+    const isPublish  = url.pathname.startsWith(PUBLISH_PREFIX);
+    const isFeed     = url.pathname.startsWith(FEED_PREFIX);
+    if (!isComments && !isLikes && !isRegister && !isLinks && !isExternal && !isPublish && !isFeed) {
       return new Response("not found", { status: 404 });
     }
 
@@ -132,6 +145,18 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
     const delMatch = /^\/([^\/]+)$/.exec(suffix);
     if (request.method === "DELETE" && delMatch)      return deleteLink(request, env, delMatch[1]);
     return jsonError(404, `no route: ${request.method} /api/links${suffix}`);
+  }
+  // ── /api/publish ────────────────────────────────────────────────
+  if (url.pathname.startsWith(PUBLISH_PREFIX)) {
+    const suffix = url.pathname.slice(PUBLISH_PREFIX.length);
+    if (request.method === "POST" && suffix === "") return publishPost(request, env);
+    return jsonError(404, `no route: ${request.method} /api/publish${suffix}`);
+  }
+  // ── /api/feed ───────────────────────────────────────────────────
+  if (url.pathname.startsWith(FEED_PREFIX)) {
+    const suffix = url.pathname.slice(FEED_PREFIX.length);
+    if (request.method === "GET" && suffix === "") return getFeed(env, url);
+    return jsonError(404, `no route: ${request.method} /api/feed${suffix}`);
   }
   return jsonError(404, `no route: ${request.method} ${url.pathname}`);
 }
@@ -1335,6 +1360,234 @@ async function verifyGoogleToken(jwt: string, env: Env): Promise<GoogleIdentity 
 
   if (!payload.sub || !payload.email || !payload.name) return null;
   return { sub: payload.sub, email: payload.email, name: payload.name, picture: payload.picture };
+}
+
+// ─── Owned posts: publish (POSSE origin) + feed (syndication source) ─────────
+//
+// The strangle: you compose ONCE here. The canonical copy is committed to the
+// content repo (git-as-database); the silos (Bluesky today, more later) get
+// syndicated copies that link back to the canonical. /api/feed emits that
+// owned store as RSS / JSON Feed — a first-class source anything can subscribe
+// to, including other creators' HQs. The owned site is the origin; the big
+// platforms become pipes.
+
+interface Post {
+  id: string;                    // `<ms-timestamp>-<8-char>` — sortable, unique
+  text: string;
+  title?: string;
+  media?: string[];              // URLs, shown on the owned site
+  author: { name: string; email: string; sub: string };  // sub = last 8 of Google sub
+  createdAt: string;             // ISO
+  canonicalUrl: string;          // the owned-site permalink (the origin)
+  syndications: Array<{ platform: string; url: string }>;  // where copies landed
+}
+
+async function publishPost(request: Request, env: Env): Promise<Response> {
+  const payload = await parseJson(request);
+  if (!payload) return jsonError(400, "invalid JSON body");
+  const { googleIdToken, content, text, title, media, syndicate } = payload as {
+    googleIdToken?: string; content?: string; text?: string; title?: string;
+    media?: unknown; syndicate?: unknown;
+  };
+  if (typeof googleIdToken !== "string") return jsonError(400, "missing googleIdToken");
+  if (typeof content !== "string" || !REPO_ALLOWLIST[content]) {
+    return jsonError(400, `unknown content stream "${content ?? ""}"`);
+  }
+  if (typeof text !== "string" || text.trim().length === 0) return jsonError(400, "missing text");
+  if (text.length > 10000) return jsonError(413, "post too long (max 10000)");
+
+  const identity = await verifyGoogleToken(googleIdToken, env);
+  if (!identity) return jsonError(401, "invalid or expired Google token");
+
+  const { owner, repo } = REPO_ALLOWLIST[content];
+  const mediaUrls = Array.isArray(media)
+    ? media.filter((m): m is string => typeof m === "string").slice(0, 8) : undefined;
+  const targets = Array.isArray(syndicate)
+    ? syndicate.filter((s): s is string => typeof s === "string") : [];
+
+  const id = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+  const post: Post = {
+    id,
+    text: text.trim(),
+    ...(typeof title === "string" && title.trim() ? { title: title.trim() } : {}),
+    ...(mediaUrls && mediaUrls.length ? { media: mediaUrls } : {}),
+    author: { name: identity.name, email: identity.email, sub: identity.sub.slice(-8) },
+    createdAt: new Date().toISOString(),
+    canonicalUrl: `${SITE_BASE}/${content}/posts/${id}`,
+    syndications: [],
+  };
+
+  // Syndicate OUT first, so the canonical record captures where copies landed.
+  const notes: string[] = [];
+  if (targets.includes("bluesky")) {
+    if (env.BLUESKY_HANDLE && env.BLUESKY_APP_PASSWORD) {
+      try {
+        const url = await publishToBluesky(env, post.text, post.canonicalUrl);
+        if (url) post.syndications.push({ platform: "bluesky", url });
+      } catch (e) {
+        notes.push(`bluesky: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    } else {
+      notes.push("bluesky: not configured (set BLUESKY_HANDLE + BLUESKY_APP_PASSWORD secrets)");
+    }
+  }
+  // RSS-out needs no push: the post is now the newest item at /api/feed?content=<content>.
+
+  const committed = await commitPost(env, owner, repo, post, identity.email);
+  if ("error" in committed) return jsonError(committed.status, committed.error);
+
+  return jsonOk({ post, syndicated: post.syndications, feedUrl: `/api/feed?content=${content}`, notes });
+}
+
+// GET → prepend → PUT posts.json (git-as-database), same shape as registerCreator.
+async function commitPost(
+  env: Env, owner: string, repo: string, post: Post, actorEmail: string,
+): Promise<{ ok: true } | { error: string; status: number }> {
+  const contentsUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${POSTS_FILE_PATH}`;
+  const getResp = await ghFetch(env, contentsUrl);
+  let posts: Post[] = [];
+  let sha: string | undefined;
+  if (getResp.ok) {
+    const file = await getResp.json() as { content: string; sha: string; encoding: string };
+    sha = file.sha;
+    if (file.encoding === "base64") {
+      try { posts = JSON.parse(b64decodeUtf8(file.content)) as Post[]; } catch { posts = []; }
+    }
+  } else if (getResp.status !== 404) {
+    return { error: `couldn't read ${POSTS_FILE_PATH}: HTTP ${getResp.status}`, status: 500 };
+  }
+  if (!Array.isArray(posts)) posts = [];
+  posts.unshift(post);                             // newest first
+  if (posts.length > 1000) posts = posts.slice(0, 1000);
+
+  const body: Record<string, unknown> = {
+    message: `post ${post.id}${post.title ? ` — ${post.title}` : ""}\n\nvia /api/publish by ${actorEmail}`,
+    content: b64encodeUtf8(JSON.stringify(posts, null, 2) + "\n"),
+  };
+  if (sha) body.sha = sha;
+  const putResp = await ghFetch(env, contentsUrl, { method: "PUT", body: JSON.stringify(body) });
+  if (!putResp.ok) return { error: `commit failed: HTTP ${putResp.status}`, status: putResp.status };
+  return { ok: true };
+}
+
+// Post to Bluesky via the AT Protocol. Teaser + canonical link (POSSE), with a
+// facet so the link is clickable. Returns the bsky.app permalink.
+async function publishToBluesky(env: Env, text: string, link: string): Promise<string | null> {
+  const sess = await fetch("https://bsky.social/xrpc/com.atproto.server.createSession", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ identifier: env.BLUESKY_HANDLE, password: env.BLUESKY_APP_PASSWORD }),
+  });
+  if (!sess.ok) throw new Error(`createSession HTTP ${sess.status}`);
+  const { accessJwt, did } = await sess.json() as { accessJwt: string; did: string };
+
+  const teaser = text.length > 260 ? text.slice(0, 259) + "…" : text;
+  const prefix = `${teaser}\n\n`;
+  const postText = `${prefix}${link}`;
+  const enc = new TextEncoder();
+  const byteStart = enc.encode(prefix).length;
+  const byteEnd = byteStart + enc.encode(link).length;
+  const record = {
+    $type: "app.bsky.feed.post",
+    text: postText,
+    createdAt: new Date().toISOString(),
+    facets: [{
+      index: { byteStart, byteEnd },
+      features: [{ $type: "app.bsky.richtext.facet#link", uri: link }],
+    }],
+  };
+  const create = await fetch("https://bsky.social/xrpc/com.atproto.repo.createRecord", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${accessJwt}` },
+    body: JSON.stringify({ repo: did, collection: "app.bsky.feed.post", record }),
+  });
+  if (!create.ok) throw new Error(`createRecord HTTP ${create.status}`);
+  const { uri } = await create.json() as { uri: string };
+  const rkey = uri.split("/").pop();
+  return rkey ? `https://bsky.app/profile/${env.BLUESKY_HANDLE}/post/${rkey}` : null;
+}
+
+// The POSSE origin feed. Reads the canonical posts store (raw = CDN-cached, no
+// token) and emits RSS 2.0 (default) or JSON Feed 1.1.
+async function getFeed(_env: Env, url: URL): Promise<Response> {
+  const content = url.searchParams.get("content") ?? "";
+  const format = (url.searchParams.get("format") ?? "rss").toLowerCase();
+  const entry = REPO_ALLOWLIST[content];
+  if (!entry) return jsonError(400, `unknown content stream "${content}"`);
+
+  const rawUrl = `https://raw.githubusercontent.com/${entry.owner}/${entry.repo}/HEAD/${POSTS_FILE_PATH}`;
+  const resp = await fetch(rawUrl);
+  let posts: Post[] = [];
+  if (resp.ok) { try { posts = await resp.json() as Post[]; } catch { posts = []; } }
+  if (!Array.isArray(posts)) posts = [];
+
+  const title = `${content} · Algorithmic Arts`;
+  const home = `${SITE_BASE}/${content}`;
+  if (format === "json") {
+    return new Response(JSON.stringify(jsonFeed(title, home, url.href, posts), null, 2), {
+      headers: { "Content-Type": "application/feed+json; charset=utf-8", "Cache-Control": "public, max-age=300" },
+    });
+  }
+  return new Response(rssFeed(title, home, posts), {
+    headers: { "Content-Type": "application/rss+xml; charset=utf-8", "Cache-Control": "public, max-age=300" },
+  });
+}
+
+function rssFeed(title: string, link: string, posts: Post[]): string {
+  const items = posts.map((p) => {
+    const t = p.title ?? (p.text.length > 80 ? p.text.slice(0, 77) + "…" : p.text);
+    const pub = new Date(p.createdAt).toUTCString();
+    return `    <item>
+      <title>${xmlEscape(t)}</title>
+      <link>${xmlEscape(p.canonicalUrl)}</link>
+      <guid isPermaLink="false">${xmlEscape(p.id)}</guid>
+      <pubDate>${pub}</pubDate>
+      <description>${xmlEscape(p.text)}</description>
+    </item>`;
+  }).join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+    <title>${xmlEscape(title)}</title>
+    <link>${xmlEscape(link)}</link>
+    <description>${xmlEscape(title)} — published on its own soil, syndicated everywhere.</description>
+${items}
+  </channel></rss>`;
+}
+
+function jsonFeed(title: string, homeUrl: string, feedUrl: string, posts: Post[]): unknown {
+  return {
+    version: "https://jsonfeed.org/version/1.1",
+    title,
+    home_page_url: homeUrl,
+    feed_url: feedUrl,
+    items: posts.map((p) => ({
+      id: p.id,
+      url: p.canonicalUrl,
+      ...(p.title ? { title: p.title } : {}),
+      content_text: p.text,
+      date_published: p.createdAt,
+      author: { name: p.author.name },
+      ...(p.media && p.media.length ? { attachments: p.media.map((u) => ({ url: u, mime_type: "image/*" })) } : {}),
+    })),
+  };
+}
+
+function xmlEscape(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
+function b64encodeUtf8(str: string): string {
+  const bytes = new TextEncoder().encode(str);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+function b64decodeUtf8(b64: string): string {
+  const bin = atob(b64.replace(/\n/g, ""));
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
