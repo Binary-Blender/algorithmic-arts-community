@@ -32,3 +32,13 @@ id = "b97dd4fda6ee4a249ceccf086f92f5ca"
 [[kv_namespaces]]
 binding = "AA_EXTERNAL"
 id = "00db597bb219462ab6fe04661727f723"
+
+# KV — dream-machine rate-limit counters + 60s manifest cache.
+# Keys:
+#   ip:<cf-connecting-ip>:<YYYY-MM-DD>  → count (TTL ~25h)
+#   global:<YYYY-MM-DD>                 → count (TTL ~25h)
+#   manifest                            → dreams.json body (TTL 60s)
+# Extra secret: HF_TOKEN — Bearer for the private BabyAI Space.
+[[kv_namespaces]]
+binding = "AA_DREAMS"
+id = "387de9f53fa347caa8db806de2f16eab"
