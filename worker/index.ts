@@ -21,7 +21,7 @@ interface Env {
   AA_LINKS: KVNamespace;
   /** KV: cached responses from external content sources (RSS / YouTube / etc.). */
   AA_EXTERNAL: KVNamespace;
-  /** KV: dream-machine rate-limit counters + short manifest cache. */
+  /** KV: dream-machine rate-limit counters (generation is all this worker does). */
   AA_DREAMS: KVNamespace;
   /** HF token — Bearer for the private BabyAI Space (image generation). */
   HF_TOKEN: string;
@@ -44,14 +44,12 @@ const PUBLISH_PREFIX  = "/api/publish";
 const FEED_PREFIX     = "/api/feed";
 const DREAM_PREFIX    = "/api/dream";
 
-// The dream machine — the imprint's free text-to-image wall. Anonymous,
-// bounded by deterministic daily caps instead of guardrail theater.
-// Canonical store is a public git repo (git-as-database): every image
-// is a commit, the gallery is dreams.json, the CDN is raw.githubusercontent.
-const DREAMS_REPO_OWNER = "Binary-Blender";
-const DREAMS_REPO_NAME  = "aa-dreams";
-const DREAMS_FILE_PATH  = "dreams.json";
-const DREAMS_RAW_BASE   = `https://raw.githubusercontent.com/${DREAMS_REPO_OWNER}/${DREAMS_REPO_NAME}/main`;
+// The dream machine — the imprint's free text-to-image generator. Anonymous,
+// bounded by deterministic daily caps instead of guardrail theater. The
+// worker ONLY generates: images are returned to the browser and never
+// stored on our side. Galleries are per-user git repos committed to
+// directly from the browser (Pattern B, BKA-style: the user's repo IS
+// the platform) — so there is no shared wall to moderate.
 const BABYAI_IMAGES_URL = "https://novasynchris-babyai.hf.space/v1/images/generations";
 const DREAM_IP_DAILY     = 12;
 const DREAM_GLOBAL_DAILY = 360;
@@ -180,7 +178,6 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
   // ── /api/dream ──────────────────────────────────────────────────
   if (url.pathname.startsWith(DREAM_PREFIX)) {
     const suffix = url.pathname.slice(DREAM_PREFIX.length);
-    if (request.method === "GET"  && suffix === "") return listDreams(request, env);
     if (request.method === "POST" && suffix === "") return dreamImage(request, env);
     return jsonError(404, `no route: ${request.method} /api/dream${suffix}`);
   }
@@ -1321,34 +1318,12 @@ interface GoogleIdentity {
 // Free text-to-image for anyone who lands on /dream — the imprint's answer
 // to metered, guardrail-heavy generators. POST generates one image through
 // the BabyAI Space (which runs our own FLUX.1-schnell weights — sovereign
-// first, metered providers as fallback) and commits it to the aa-dreams
-// repo: the wall's history IS the git history, the CDN is raw.github.
+// first, metered providers as fallback) and returns it. That is ALL this
+// worker does: no storage, no shared gallery, no moderation surface.
+// Keeping a gallery is the user's move — the page commits to THEIR git
+// repo with THEIR token, straight from the browser (Pattern B, BKA-style).
 // Anonymous by design; abuse is bounded by two deterministic daily
 // counters (per-IP + global), not content policing.
-
-interface Dream {
-  id: string;
-  prompt: string;
-  size: string;
-  seed?: number;
-  createdAt: string;
-  image: string;      // repo-relative path in aa-dreams
-  url: string;        // raw.githubusercontent CDN url
-  backend?: string;   // sovereign | providers (provenance of the pixels)
-}
-
-async function listDreams(_request: Request, env: Env): Promise<Response> {
-  const cached = await env.AA_DREAMS.get("manifest");
-  if (cached) {
-    return new Response(cached, { status: 200, headers: { "Content-Type": "application/json" } });
-  }
-  const resp = await ghFetch(env, `https://api.github.com/repos/${DREAMS_REPO_OWNER}/${DREAMS_REPO_NAME}/contents/${DREAMS_FILE_PATH}`);
-  if (!resp.ok) return jsonError(502, `couldn't read the dream wall: HTTP ${resp.status}`);
-  const file = await resp.json() as { content: string };
-  const body = b64decodeUtf8(file.content);
-  await env.AA_DREAMS.put("manifest", body, { expirationTtl: 60 });
-  return new Response(body, { status: 200, headers: { "Content-Type": "application/json" } });
-}
 
 async function dreamImage(request: Request, env: Env): Promise<Response> {
   const payload = await parseJson(request);
@@ -1397,71 +1372,22 @@ async function dreamImage(request: Request, env: Env): Promise<Response> {
     env.AA_DREAMS.put(globalKey, String(globalCount + 1), { expirationTtl: 90000 }),
   ]);
 
-  const id = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
-  const imagePath = `dreams/${id}.png`;
-  const dream: Dream = {
-    id,
+  const dream = {
+    id: `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
     prompt: prompt.trim(),
     size: pickedSize,
     ...(pickedSeed !== undefined ? { seed: pickedSeed } : {}),
     createdAt: new Date().toISOString(),
-    image: imagePath,
-    url: `${DREAMS_RAW_BASE}/${imagePath}`,
     ...(backend ? { backend } : {}),
   };
 
-  // The generator already speaks git's language: b64 straight into the contents API.
-  const putImg = await ghFetch(env, `https://api.github.com/repos/${DREAMS_REPO_OWNER}/${DREAMS_REPO_NAME}/contents/${imagePath}`, {
-    method: "PUT",
-    body: JSON.stringify({ message: `dream ${id}\n\n"${dream.prompt.slice(0, 200)}"`, content: b64 }),
-  });
-  if (!putImg.ok) return jsonError(502, `couldn't commit the image: HTTP ${putImg.status}`);
-
-  const committed = await commitDream(env, dream);
-  if ("error" in committed) return jsonError(committed.status, committed.error);
-  await env.AA_DREAMS.delete("manifest");
-
+  // The image goes back to the browser and nowhere else. If the user has
+  // connected their own repo, the page commits it there with their token.
   return jsonOk({
     dream,
-    b64_json: b64,  // so the page shows it instantly, before the CDN catches up
-    remaining: { you: DREAM_IP_DAILY - ipCount - 1, wall: DREAM_GLOBAL_DAILY - globalCount - 1 },
+    b64_json: b64,
+    remaining: { you: DREAM_IP_DAILY - ipCount - 1, today: DREAM_GLOBAL_DAILY - globalCount - 1 },
   });
-}
-
-// GET → prepend → PUT dreams.json, same git-as-database shape as commitPost.
-// One retry on sha conflict (two dreamers landing in the same moment).
-async function commitDream(env: Env, dream: Dream): Promise<{ ok: true } | { error: string; status: number }> {
-  const contentsUrl = `https://api.github.com/repos/${DREAMS_REPO_OWNER}/${DREAMS_REPO_NAME}/contents/${DREAMS_FILE_PATH}`;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const getResp = await ghFetch(env, contentsUrl);
-    let dreams: Dream[] = [];
-    let sha: string | undefined;
-    if (getResp.ok) {
-      const file = await getResp.json() as { content: string; sha: string; encoding: string };
-      sha = file.sha;
-      if (file.encoding === "base64") {
-        try { dreams = JSON.parse(b64decodeUtf8(file.content)) as Dream[]; } catch { dreams = []; }
-      }
-    } else if (getResp.status !== 404) {
-      return { error: `couldn't read ${DREAMS_FILE_PATH}: HTTP ${getResp.status}`, status: 502 };
-    }
-    if (!Array.isArray(dreams)) dreams = [];
-    dreams.unshift(dream);                          // newest first
-    if (dreams.length > 2000) dreams = dreams.slice(0, 2000);
-
-    const body: Record<string, unknown> = {
-      message: `wall: ${dream.id}`,
-      content: b64encodeUtf8(JSON.stringify(dreams, null, 2) + "\n"),
-    };
-    if (sha) body.sha = sha;
-    const putResp = await ghFetch(env, contentsUrl, { method: "PUT", body: JSON.stringify(body) });
-    if (putResp.ok) return { ok: true };
-    if (putResp.status !== 409 && putResp.status !== 422) {
-      return { error: `manifest commit failed: HTTP ${putResp.status}`, status: 502 };
-    }
-    // sha moved under us — refetch and try once more
-  }
-  return { error: "manifest commit failed after retry", status: 502 };
 }
 
 const GOOGLE_CERTS_URL = "https://www.googleapis.com/oauth2/v3/certs";
