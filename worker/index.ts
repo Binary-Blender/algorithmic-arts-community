@@ -75,6 +75,7 @@ const REPO_RE = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/;
 const REPO_ALLOWLIST: Record<string, { owner: string; repo: string }> = {
   "secret-life-of-ai":            { owner: "Binary-Blender", repo: "secret-life-of-ai" },
   "vela-works":                   { owner: "Binary-Blender", repo: "vela-works" },
+  "red-flag-works":               { owner: "Binary-Blender", repo: "red-flag-works" },
   "soren-vael-works":             { owner: "Binary-Blender", repo: "soren-vael-works" },
   "aiwinwin-books":               { owner: "Binary-Blender", repo: "aiwinwin-books" },
   "algorithmic-arts-books":       { owner: "Binary-Blender", repo: "algorithmic-arts-books" },
