@@ -79,6 +79,7 @@ const REPO_ALLOWLIST: Record<string, { owner: string; repo: string }> = {
   "soren-vael-works":             { owner: "Binary-Blender", repo: "soren-vael-works" },
   "mason-ryder-works":            { owner: "Binary-Blender", repo: "mason-ryder-works" },
   "brother-aldric-works":         { owner: "Binary-Blender", repo: "brother-aldric-works" },
+  "nova-keras-works":             { owner: "Binary-Blender", repo: "nova-keras-works" },
   "aiwinwin-books":               { owner: "Binary-Blender", repo: "aiwinwin-books" },
   "algorithmic-arts-books":       { owner: "Binary-Blender", repo: "algorithmic-arts-books" },
   "algorithmic-arts-community":   { owner: "Binary-Blender", repo: "algorithmic-arts-community" },
