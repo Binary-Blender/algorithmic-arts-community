@@ -76,6 +76,7 @@ const REPO_ALLOWLIST: Record<string, { owner: string; repo: string }> = {
   "secret-life-of-ai":            { owner: "Binary-Blender", repo: "secret-life-of-ai" },
   "vela-works":                   { owner: "Binary-Blender", repo: "vela-works" },
   "red-flag-works":               { owner: "Binary-Blender", repo: "red-flag-works" },
+  "split-screen-works":           { owner: "Binary-Blender", repo: "split-screen-works" },
   "soren-vael-works":             { owner: "Binary-Blender", repo: "soren-vael-works" },
   "mason-ryder-works":            { owner: "Binary-Blender", repo: "mason-ryder-works" },
   "brother-aldric-works":         { owner: "Binary-Blender", repo: "brother-aldric-works" },
