@@ -54,6 +54,16 @@ const BABYAI_IMAGES_URL = "https://novasynchris-babyai.hf.space/v1/images/genera
 const DREAM_IP_DAILY     = 12;
 const DREAM_GLOBAL_DAILY = 360;
 const DREAM_SIZES = new Set(["1024x1024", "832x1216", "1216x832", "1344x768", "768x1344"]);
+// HF sleeps the BabyAI Space once it has been idle long enough. The first
+// request after that doesn't fail so much as arrive early: the Space's router
+// answers 503 while the container boots, and the boot finishes seconds later.
+// Passing that 503 straight to the browser turned a nap into an outage, so we
+// wait through it instead. The budget sits comfortably under Cloudflare's
+// ~100s ceiling on the client connection, so we always answer before the edge
+// gives up on us. cron-hub pings the Space every 15 min to keep this cold path
+// rare; this is what happens when it happens anyway.
+const DREAM_WAKE_BUDGET_MS  = 70_000;
+const DREAM_WAKE_BACKOFF_MS = [0, 2_000, 5_000, 10_000, 15_000];
 
 // Owned posts (POSSE origin) live in posts.json at the root of the content repo —
 // git-as-database, same shape as creators.json. The canonical URL of every post
@@ -1360,17 +1370,23 @@ async function dreamImage(request: Request, env: Env): Promise<Response> {
     return jsonError(429, `you've dreamed ${DREAM_IP_DAILY} today — come back tomorrow`);
   }
 
-  // Generate through BabyAI (sovereign flux first; it falls back internally).
-  const genResp = await fetch(BABYAI_IMAGES_URL, {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${env.HF_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      prompt: prompt.trim(),
-      size: pickedSize,
-      ...(pickedSeed !== undefined ? { seed: pickedSeed } : {}),
-    }),
-  });
-  if (!genResp.ok) return passUpstreamError(genResp);
+  // Generate through BabyAI (sovereign flux first; it falls back internally),
+  // waiting out a cold start rather than reporting one.
+  const attempt = await generateThroughBabyAI(env, JSON.stringify({
+    prompt: prompt.trim(),
+    size: pickedSize,
+    ...(pickedSeed !== undefined ? { seed: pickedSeed } : {}),
+  }));
+  if (!attempt.ok) {
+    // Two different failures, told two different ways. A Space still booting
+    // is a nap — the browser is asked to try again shortly, in the voice the
+    // rest of the page uses. Anything else is a real fault and says so.
+    if (attempt.waking) {
+      return jsonError(503, "our babies are still waking up from their nap — give them a minute and dream again", { waking: true });
+    }
+    return jsonError(attempt.status, `upstream ${attempt.status}: ${attempt.detail}`);
+  }
+  const genResp = attempt.resp;
   const gen = await genResp.json() as { data?: Array<{ b64_json?: string }> };
   const b64 = gen.data?.[0]?.b64_json;
   if (!b64) return jsonError(502, "generator returned no image");
@@ -1398,6 +1414,49 @@ async function dreamImage(request: Request, env: Env): Promise<Response> {
     b64_json: b64,
     remaining: { you: DREAM_IP_DAILY - ipCount - 1, today: DREAM_GLOBAL_DAILY - globalCount - 1 },
   });
+}
+
+// One generation call, retried through a cold start.
+//
+// Only 5xx and transport errors are retried: those are the shapes a booting
+// Space produces. A 4xx is a verdict — a bad token, a rejected prompt — and
+// repeating it just burns the budget and answers slower, so it returns at
+// once. Successive attempts back off so a Space that needs the full boot gets
+// a handful of tries rather than a hammering.
+async function generateThroughBabyAI(env: Env, body: string): Promise<
+  | { ok: true; resp: Response }
+  | { ok: false; waking: boolean; status: number; detail: string }
+> {
+  const deadline = Date.now() + DREAM_WAKE_BUDGET_MS;
+  let last = { waking: true, status: 503, detail: "the space never answered" };
+
+  for (let attempt = 0; ; attempt++) {
+    const backoff = DREAM_WAKE_BACKOFF_MS[Math.min(attempt, DREAM_WAKE_BACKOFF_MS.length - 1)] as number;
+    if (backoff > 0) {
+      if (Date.now() + backoff >= deadline) break;
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 1_000) break;
+
+    try {
+      const resp = await fetch(BABYAI_IMAGES_URL, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${env.HF_TOKEN}`, "Content-Type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(remaining),
+      });
+      if (resp.ok) return { ok: true, resp };
+      const detail = (await resp.text().catch(() => "")).slice(0, 300);
+      if (resp.status < 500) return { ok: false, waking: false, status: resp.status, detail };
+      last = { waking: true, status: resp.status, detail };
+    } catch (e) {
+      // Aborted at the deadline, or the connection dropped mid-boot.
+      last = { waking: true, status: 504, detail: (e as Error).message };
+    }
+    if (Date.now() >= deadline) break;
+  }
+  return { ok: false, ...last };
 }
 
 const GOOGLE_CERTS_URL = "https://www.googleapis.com/oauth2/v3/certs";
@@ -1757,8 +1816,8 @@ function jsonOk(data: unknown): Response {
   });
 }
 
-function jsonError(status: number, message: string): Response {
-  return new Response(JSON.stringify({ error: message }), {
+function jsonError(status: number, message: string, extra?: Record<string, unknown>): Response {
+  return new Response(JSON.stringify({ error: message, ...extra }), {
     status,
     headers: { "Content-Type": "application/json" },
   });
