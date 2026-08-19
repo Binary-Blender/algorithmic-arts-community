@@ -25,6 +25,9 @@ interface Env {
   AA_DREAMS: KVNamespace;
   /** HF token — Bearer for the private BabyAI Space (image generation). */
   HF_TOKEN: string;
+  /** Optional: shared secret that lifts the dream machine's daily caps for the
+   *  holder. Unset means nobody is admin — never that everybody is. */
+  DREAM_ADMIN_KEY?: string;
   /** Optional: YouTube Data API v3 key. If unset, /api/external?type=youtube-channel returns 503. */
   YOUTUBE_API_KEY?: string;
   /** Optional: Spotify Developer app credentials for Client Credentials flow. */
@@ -1354,20 +1357,26 @@ async function dreamImage(request: Request, env: Env): Promise<Response> {
   const pickedSize = typeof size === "string" && DREAM_SIZES.has(size) ? size : "1024x1024";
   const pickedSeed = typeof seed === "number" && Number.isFinite(seed) && seed >= 0 ? Math.floor(seed) : undefined;
 
-  // Deterministic daily caps — the only gate on the free wall.
+  // Deterministic daily caps — the only gate on the free wall. The house holds
+  // a key that lifts them: the caps exist to bound what strangers can spend,
+  // and the person paying the bill is not a stranger.
   const day = new Date().toISOString().slice(0, 10);
+  const admin = isDreamAdmin(request, env);
   const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
   const ipKey = `ip:${ip}:${day}`;
   const globalKey = `global:${day}`;
-  const [ipCount, globalCount] = await Promise.all([
+  const [ipCount, globalCount, adminCount] = await Promise.all([
     env.AA_DREAMS.get(ipKey).then((v) => Number(v ?? 0)),
     env.AA_DREAMS.get(globalKey).then((v) => Number(v ?? 0)),
+    admin ? env.AA_DREAMS.get(`admin:${day}`).then((v) => Number(v ?? 0)) : Promise.resolve(0),
   ]);
-  if (globalCount >= DREAM_GLOBAL_DAILY) {
-    return jsonError(429, "the wall has dreamed its fill for today — come back tomorrow");
-  }
-  if (ipCount >= DREAM_IP_DAILY) {
-    return jsonError(429, `you've dreamed ${DREAM_IP_DAILY} today — come back tomorrow`);
+  if (!admin) {
+    if (globalCount >= DREAM_GLOBAL_DAILY) {
+      return jsonError(429, "the wall has dreamed its fill for today — come back tomorrow");
+    }
+    if (ipCount >= DREAM_IP_DAILY) {
+      return jsonError(429, `you've dreamed ${DREAM_IP_DAILY} today — come back tomorrow`);
+    }
   }
 
   // Generate through BabyAI (sovereign flux first; it falls back internally),
@@ -1392,11 +1401,16 @@ async function dreamImage(request: Request, env: Env): Promise<Response> {
   if (!b64) return jsonError(502, "generator returned no image");
   const backend = genResp.headers.get("x-babyai-image-backend") ?? undefined;
 
-  // Count it. 25h TTL so day keys clean themselves up.
-  await Promise.all([
-    env.AA_DREAMS.put(ipKey, String(ipCount + 1), { expirationTtl: 90000 }),
-    env.AA_DREAMS.put(globalKey, String(globalCount + 1), { expirationTtl: 90000 }),
-  ]);
+  // Count it. 25h TTL so day keys clean themselves up. Admin dreams are counted
+  // on their own key and left out of both public counters: charging them to the
+  // global budget would let a busy afternoon at the keyboard close the free
+  // wall to everyone else, which is exactly backwards.
+  await Promise.all(admin
+    ? [env.AA_DREAMS.put(`admin:${day}`, String(adminCount + 1), { expirationTtl: 90000 })]
+    : [
+      env.AA_DREAMS.put(ipKey, String(ipCount + 1), { expirationTtl: 90000 }),
+      env.AA_DREAMS.put(globalKey, String(globalCount + 1), { expirationTtl: 90000 }),
+    ]);
 
   const dream = {
     id: `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
@@ -1412,8 +1426,32 @@ async function dreamImage(request: Request, env: Env): Promise<Response> {
   return jsonOk({
     dream,
     b64_json: b64,
-    remaining: { you: DREAM_IP_DAILY - ipCount - 1, today: DREAM_GLOBAL_DAILY - globalCount - 1 },
+    // `remaining` keeps its shape for everyone. Admins get nulls — "no number
+    // applies" — plus the flag the page reads, rather than a fake big number.
+    ...(admin ? { admin: true, adminToday: adminCount + 1 } : {}),
+    remaining: admin
+      ? { you: null, today: null }
+      : { you: DREAM_IP_DAILY - ipCount - 1, today: DREAM_GLOBAL_DAILY - globalCount - 1 },
   });
+}
+
+// Is this request the house? A shared secret in X-Dream-Key, compared against
+// the worker secret. Deliberately a header and not a query param, so the key
+// stays out of URLs, Referers, and any log that records paths.
+//
+// Two properties matter more than they look. If DREAM_ADMIN_KEY is unset the
+// answer is always false — an unconfigured worker grants nothing rather than
+// everything. And the comparison runs over every byte regardless of where the
+// first mismatch is, so the time it takes says nothing about how much of the
+// key a guesser got right.
+function isDreamAdmin(request: Request, env: Env): boolean {
+  const expected = env.DREAM_ADMIN_KEY;
+  if (!expected) return false;
+  const given = request.headers.get("X-Dream-Key") ?? "";
+  if (given.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= given.charCodeAt(i) ^ expected.charCodeAt(i);
+  return diff === 0;
 }
 
 // One generation call, retried through a cold start.
@@ -1833,7 +1871,7 @@ function preflight(request: Request): Response {
     headers: {
       "Access-Control-Allow-Origin":  origin,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, X-Dream-Key",
       "Access-Control-Max-Age":       "86400",
       "Vary":                         "Origin",
     },
