@@ -65,8 +65,10 @@ const DREAM_SIZES = new Set(["1024x1024", "832x1216", "1216x832", "1344x768", "7
 // ~100s ceiling on the client connection, so we always answer before the edge
 // gives up on us. cron-hub pings the Space every 15 min to keep this cold path
 // rare; this is what happens when it happens anyway.
-const DREAM_WAKE_BUDGET_MS  = 70_000;
-const DREAM_WAKE_BACKOFF_MS = [0, 2_000, 5_000, 10_000, 15_000];
+// One attempt, generous timeout. The timeout is for the slow *success* case,
+// not for retries: a healthy 1024x1024 takes ~9s, and HF sometimes holds the
+// connection open through a cold boot and then serves a 200 (~32s observed).
+const DREAM_ATTEMPT_MS = 45_000;
 
 // Owned posts (POSSE origin) live in posts.json at the root of the content repo —
 // git-as-database, same shape as creators.json. The canonical URL of every post
@@ -1454,47 +1456,35 @@ function isDreamAdmin(request: Request, env: Env): boolean {
   return diff === 0;
 }
 
-// One generation call, retried through a cold start.
+// One generation call. Deliberately no retry loop.
 //
-// Only 5xx and transport errors are retried: those are the shapes a booting
-// Space produces. A 4xx is a verdict — a bad token, a rejected prompt — and
-// repeating it just burns the budget and answers slower, so it returns at
-// once. Successive attempts back off so a Space that needs the full boot gets
-// a handful of tries rather than a hammering.
+// The first version budgeted 70s and retried with backoff, which was the wrong
+// trade: when the Space is asleep HF answers 503 in about a second, so the
+// retries bought nothing and the browser sat on a dead button for over a
+// minute with no way to tell a slow dream from a broken one. Waiting is the
+// *browser's* job — it can show a countdown and let the visitor walk away.
+// Here we answer fast and say which kind of failure it was.
+//
+// A 5xx means the Space is booting: report it as waking so the page retries.
+// A 4xx is a verdict — bad token, rejected prompt — and is passed through.
 async function generateThroughBabyAI(env: Env, body: string): Promise<
   | { ok: true; resp: Response }
   | { ok: false; waking: boolean; status: number; detail: string }
 > {
-  const deadline = Date.now() + DREAM_WAKE_BUDGET_MS;
-  let last = { waking: true, status: 503, detail: "the space never answered" };
-
-  for (let attempt = 0; ; attempt++) {
-    const backoff = DREAM_WAKE_BACKOFF_MS[Math.min(attempt, DREAM_WAKE_BACKOFF_MS.length - 1)] as number;
-    if (backoff > 0) {
-      if (Date.now() + backoff >= deadline) break;
-      await new Promise((r) => setTimeout(r, backoff));
-    }
-    const remaining = deadline - Date.now();
-    if (remaining <= 1_000) break;
-
-    try {
-      const resp = await fetch(BABYAI_IMAGES_URL, {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${env.HF_TOKEN}`, "Content-Type": "application/json" },
-        body,
-        signal: AbortSignal.timeout(remaining),
-      });
-      if (resp.ok) return { ok: true, resp };
-      const detail = (await resp.text().catch(() => "")).slice(0, 300);
-      if (resp.status < 500) return { ok: false, waking: false, status: resp.status, detail };
-      last = { waking: true, status: resp.status, detail };
-    } catch (e) {
-      // Aborted at the deadline, or the connection dropped mid-boot.
-      last = { waking: true, status: 504, detail: (e as Error).message };
-    }
-    if (Date.now() >= deadline) break;
+  try {
+    const resp = await fetch(BABYAI_IMAGES_URL, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${env.HF_TOKEN}`, "Content-Type": "application/json" },
+      body,
+      signal: AbortSignal.timeout(DREAM_ATTEMPT_MS),
+    });
+    if (resp.ok) return { ok: true, resp };
+    const detail = (await resp.text().catch(() => "")).slice(0, 300);
+    return { ok: false, waking: resp.status >= 500, status: resp.status, detail };
+  } catch (e) {
+    // Timed out or the connection dropped mid-boot — same answer to the page.
+    return { ok: false, waking: true, status: 504, detail: (e as Error).message };
   }
-  return { ok: false, ...last };
 }
 
 const GOOGLE_CERTS_URL = "https://www.googleapis.com/oauth2/v3/certs";
