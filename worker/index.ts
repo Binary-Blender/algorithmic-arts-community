@@ -69,6 +69,13 @@ const DREAM_SIZES = new Set(["1024x1024", "832x1216", "1216x832", "1344x768", "7
 // not for retries: a healthy 1024x1024 takes ~9s, and HF sometimes holds the
 // connection open through a cold boot and then serves a 200 (~32s observed).
 const DREAM_ATTEMPT_MS = 45_000;
+// The sovereign Space, and how often we're willing to tell it to get up.
+// HF's wake-on-request does not fire for this call — a sleeping Space answers
+// 503 in under half a second without booting — so a visitor who waits politely
+// waits forever. We ask the control plane instead, at most once every few
+// minutes so a crowd can't turn one nap into a restart storm.
+const BABYAI_SPACE_ID        = "novasynchris/babyai";
+const DREAM_WAKE_THROTTLE_S  = 300;
 
 // Owned posts (POSSE origin) live in posts.json at the root of the content repo —
 // git-as-database, same shape as creators.json. The canonical URL of every post
@@ -1393,6 +1400,9 @@ async function dreamImage(request: Request, env: Env): Promise<Response> {
     // is a nap — the browser is asked to try again shortly, in the voice the
     // rest of the page uses. Anything else is a real fault and says so.
     if (attempt.waking) {
+      // Kick it properly before we answer, so the page's retries have something
+      // to come back to. ~0.5s on a request that already failed.
+      await kickSovereignAwake(env);
       return jsonError(503, "our babies are still waking up from their nap — give them a minute and dream again", { waking: true });
     }
     return jsonError(attempt.status, `upstream ${attempt.status}: ${attempt.detail}`);
@@ -1454,6 +1464,28 @@ function isDreamAdmin(request: Request, env: Env): boolean {
   let diff = 0;
   for (let i = 0; i < expected.length; i++) diff |= given.charCodeAt(i) ^ expected.charCodeAt(i);
   return diff === 0;
+}
+
+// Tell a sleeping Space to get up, through the control plane.
+//
+// Deliberately NOT another request to the app: that is the thing we just
+// observed failing. `POST /api/spaces/{id}/restart` is an explicit instruction
+// that returns at once and boots server-side regardless of who is listening.
+//
+// Throttled through KV because this is reachable from a public page: the first
+// visitor in a five-minute window pays the call, everyone else just gets the
+// nap message while the boot they triggered finishes. Failures are swallowed —
+// the visitor's answer does not depend on this working, and cron-hub is still
+// watching the Space on its own schedule.
+async function kickSovereignAwake(env: Env): Promise<void> {
+  const key = `wake:${BABYAI_SPACE_ID}`;
+  if (await env.AA_DREAMS.get(key)) return;
+  await env.AA_DREAMS.put(key, new Date().toISOString(), { expirationTtl: DREAM_WAKE_THROTTLE_S });
+  await fetch(`https://huggingface.co/api/spaces/${BABYAI_SPACE_ID}/restart`, {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${env.HF_TOKEN}` },
+    signal: AbortSignal.timeout(10_000),
+  }).catch(() => {});
 }
 
 // One generation call. Deliberately no retry loop.
