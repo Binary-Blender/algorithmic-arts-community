@@ -76,6 +76,9 @@ const DREAM_ATTEMPT_MS = 45_000;
 // minutes so a crowd can't turn one nap into a restart storm.
 const BABYAI_SPACE_ID        = "novasynchris/babyai";
 const DREAM_WAKE_THROTTLE_S  = 300;
+// How long the per-day backend tallies live. 30 days, day-keyed, so the keys
+// expire themselves and there's always about a month of history to look back on.
+const DREAM_BACKEND_TTL_S    = 2_592_000;
 
 // Owned posts (POSSE origin) live in posts.json at the root of the content repo —
 // git-as-database, same shape as creators.json. The canonical URL of every post
@@ -211,6 +214,7 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
   if (url.pathname.startsWith(DREAM_PREFIX)) {
     const suffix = url.pathname.slice(DREAM_PREFIX.length);
     if (request.method === "POST" && suffix === "") return dreamImage(request, env);
+    if (request.method === "GET" && suffix === "/backends") return dreamBackends(env);
     return jsonError(404, `no route: ${request.method} /api/dream${suffix}`);
   }
   return jsonError(404, `no route: ${request.method} ${url.pathname}`);
@@ -1417,12 +1421,15 @@ async function dreamImage(request: Request, env: Env): Promise<Response> {
   // on their own key and left out of both public counters: charging them to the
   // global budget would let a busy afternoon at the keyboard close the free
   // wall to everyone else, which is exactly backwards.
-  await Promise.all(admin
-    ? [env.AA_DREAMS.put(`admin:${day}`, String(adminCount + 1), { expirationTtl: 90000 })]
-    : [
-      env.AA_DREAMS.put(ipKey, String(ipCount + 1), { expirationTtl: 90000 }),
-      env.AA_DREAMS.put(globalKey, String(globalCount + 1), { expirationTtl: 90000 }),
-    ]);
+  await Promise.all([
+    recordBackend(env, day, backend ?? "unknown"),
+    ...(admin
+      ? [env.AA_DREAMS.put(`admin:${day}`, String(adminCount + 1), { expirationTtl: 90000 })]
+      : [
+        env.AA_DREAMS.put(ipKey, String(ipCount + 1), { expirationTtl: 90000 }),
+        env.AA_DREAMS.put(globalKey, String(globalCount + 1), { expirationTtl: 90000 }),
+      ]),
+  ]);
 
   const dream = {
     id: `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
@@ -1464,6 +1471,59 @@ function isDreamAdmin(request: Request, env: Env): boolean {
   let diff = 0;
   for (let i = 0; i < expected.length; i++) diff |= given.charCodeAt(i) ^ expected.charCodeAt(i);
   return diff === 0;
+}
+
+// Which backend served each dream, tallied by day.
+//
+// The sovereign ZeroGPU path is free and the provider fallback is metered, so a
+// silent slide from one to the other spends money while every response stays
+// 200. That is not hypothetical: on 2026-09-10 a token that failed to attribute
+// ZeroGPU quota sent every image to the paid path for a day, and the only tell
+// was a field in the response nobody was reading. Now it leaves a trail.
+//
+// Read-modify-write on KV drops the occasional increment when two dreams land
+// together. That is acceptable here — this is a trend signal, not an invoice.
+async function recordBackend(env: Env, day: string, backend: string): Promise<void> {
+  const key = `backend:${day}:${backend}`;
+  const n = Number((await env.AA_DREAMS.get(key)) ?? 0);
+  await env.AA_DREAMS.put(key, String(n + 1), { expirationTtl: DREAM_BACKEND_TTL_S });
+}
+
+// GET /api/dream/backends — the trail, newest day first.
+//
+// `sovereignPct` is the number to glance at: 100 means the free GPU served
+// everything, and anything well below it means the metered fallback is carrying
+// traffic and something upstream wants looking at.
+async function dreamBackends(env: Env): Promise<Response> {
+  const { keys } = await env.AA_DREAMS.list({ prefix: "backend:" });
+  // Read every key first, then aggregate synchronously — folding into a map
+  // inside the async callbacks would let two same-day keys clobber each other.
+  const rows = await Promise.all(keys.map(async (k) => {
+    const [, day, name] = k.name.split(":");
+    return { day, name, n: Number((await env.AA_DREAMS.get(k.name)) ?? 0) };
+  }));
+
+  const byDay = new Map<string, Record<string, number>>();
+  for (const { day, name, n } of rows) {
+    if (!day || !name) continue;
+    const row = byDay.get(day) ?? {};
+    row[name] = (row[name] ?? 0) + n;
+    byDay.set(day, row);
+  }
+
+  const days = [...byDay.entries()]
+    .sort((a, b) => b[0].localeCompare(a[0]))
+    .map(([date, counts]) => {
+      const total = Object.values(counts).reduce((a, b) => a + b, 0);
+      return {
+        date,
+        ...counts,
+        total,
+        sovereignPct: total ? Math.round(((counts.sovereign ?? 0) / total) * 100) : null,
+      };
+    });
+
+  return jsonOk({ days, note: "sovereignPct below 100 means the metered fallback served traffic" });
 }
 
 // Tell a sleeping Space to get up, through the control plane.
