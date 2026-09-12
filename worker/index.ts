@@ -79,6 +79,19 @@ const DREAM_WAKE_THROTTLE_S  = 300;
 // How long the per-day backend tallies live. 30 days, day-keyed, so the keys
 // expire themselves and there's always about a month of history to look back on.
 const DREAM_BACKEND_TTL_S    = 2_592_000;
+// The sovereign GPU, called directly.
+//
+// The images used to go page → worker → BabyAI → flux-schnell. That middle hop
+// is a Space calling a Space over the public hf.space proxy, and HF rate-limits
+// it: the BabyAI container earns a persistent 429 after modest volume and only
+// a restart clears it (2026-09-11/12, 29 consecutive fallbacks, zero sovereign
+// successes, while the same token hand-run from a terminal worked every time).
+// So the worker now speaks the Gradio REST protocol itself. BabyAI stays in the
+// chain only as the metered fallback it always was.
+const FLUX_SPACE_ID   = "novasynchris/flux-schnell";
+const FLUX_INFER_URL  = `https://novasynchris-flux-schnell.hf.space/gradio_api/call/infer`;
+const FLUX_STEPS      = 4;            // schnell is a 4-step model; more is waste
+const FLUX_ATTEMPT_MS = 35_000;       // queue + ~5s generation, with room
 
 // Owned posts (POSSE origin) live in posts.json at the root of the content repo —
 // git-as-database, same shape as creators.json. The canonical URL of every post
@@ -1392,30 +1405,51 @@ async function dreamImage(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  // Generate through BabyAI (sovereign flux first; it falls back internally),
-  // waiting out a cold start rather than reporting one.
-  const attempt = await generateThroughBabyAI(env, JSON.stringify({
+  // ── Generate ───────────────────────────────────────────────────────
+  // Straight to our own GPU first. BabyAI is the fallback, not the route: it
+  // is a Space calling a Space, which HF rate-limits into a persistent 429.
+  const [w, h] = pickedSize.split("x").map(Number) as [number, number];
+  let b64: string | undefined;
+  let backend: string | undefined;
+  let route: "direct" | "babyai";
+
+  const direct = await generateOnSovereignGpu(env, {
     prompt: prompt.trim(),
-    size: pickedSize,
+    width: w,
+    height: h,
     ...(pickedSeed !== undefined ? { seed: pickedSeed } : {}),
-  }));
-  if (!attempt.ok) {
-    // Two different failures, told two different ways. A Space still booting
-    // is a nap — the browser is asked to try again shortly, in the voice the
-    // rest of the page uses. Anything else is a real fault and says so.
-    if (attempt.waking) {
-      // Kick it properly before we answer, so the page's retries have something
-      // to come back to. ~0.5s on a request that already failed.
-      await kickSovereignAwake(env);
-      return jsonError(503, "our babies are still waking up from their nap — give them a minute and dream again", { waking: true });
+  });
+
+  if (direct.ok) {
+    b64 = toBase64(direct.png);
+    backend = "sovereign";
+    route = "direct";
+  } else {
+    // If the Space is asleep rather than busy, tell it to get up — the page's
+    // retries need something to come back to.
+    if (direct.waking) await kickSpaceAwake(env, FLUX_SPACE_ID);
+
+    const attempt = await generateThroughBabyAI(env, JSON.stringify({
+      prompt: prompt.trim(),
+      size: pickedSize,
+      ...(pickedSeed !== undefined ? { seed: pickedSeed } : {}),
+    }));
+    if (!attempt.ok) {
+      // Two different failures, told two different ways. A Space still booting
+      // is a nap — the browser is asked to try again shortly, in the voice the
+      // rest of the page uses. Anything else is a real fault and says so.
+      if (attempt.waking) {
+        await kickSpaceAwake(env, BABYAI_SPACE_ID);
+        return jsonError(503, "our babies are still waking up from their nap — give them a minute and dream again", { waking: true });
+      }
+      return jsonError(attempt.status, `upstream ${attempt.status}: ${attempt.detail}`);
     }
-    return jsonError(attempt.status, `upstream ${attempt.status}: ${attempt.detail}`);
+    const gen = await attempt.resp.json() as { data?: Array<{ b64_json?: string }> };
+    b64 = gen.data?.[0]?.b64_json;
+    backend = attempt.resp.headers.get("x-babyai-image-backend") ?? undefined;
+    route = "babyai";
   }
-  const genResp = attempt.resp;
-  const gen = await genResp.json() as { data?: Array<{ b64_json?: string }> };
-  const b64 = gen.data?.[0]?.b64_json;
   if (!b64) return jsonError(502, "generator returned no image");
-  const backend = genResp.headers.get("x-babyai-image-backend") ?? undefined;
 
   // Count it. 25h TTL so day keys clean themselves up. Admin dreams are counted
   // on their own key and left out of both public counters: charging them to the
@@ -1438,6 +1472,7 @@ async function dreamImage(request: Request, env: Env): Promise<Response> {
     ...(pickedSeed !== undefined ? { seed: pickedSeed } : {}),
     createdAt: new Date().toISOString(),
     ...(backend ? { backend } : {}),
+    route,
   };
 
   // The image goes back to the browser and nowhere else. If the user has
@@ -1537,15 +1572,126 @@ async function dreamBackends(env: Env): Promise<Response> {
 // nap message while the boot they triggered finishes. Failures are swallowed —
 // the visitor's answer does not depend on this working, and cron-hub is still
 // watching the Space on its own schedule.
-async function kickSovereignAwake(env: Env): Promise<void> {
-  const key = `wake:${BABYAI_SPACE_ID}`;
+async function kickSpaceAwake(env: Env, spaceId: string): Promise<void> {
+  const key = `wake:${spaceId}`;
   if (await env.AA_DREAMS.get(key)) return;
   await env.AA_DREAMS.put(key, new Date().toISOString(), { expirationTtl: DREAM_WAKE_THROTTLE_S });
-  await fetch(`https://huggingface.co/api/spaces/${BABYAI_SPACE_ID}/restart`, {
+  await fetch(`https://huggingface.co/api/spaces/${spaceId}/restart`, {
     method: "POST",
     headers: { "Authorization": `Bearer ${env.HF_TOKEN}` },
     signal: AbortSignal.timeout(10_000),
   }).catch(() => {});
+}
+
+// Generate on the sovereign GPU, talking to the Gradio Space directly.
+//
+// Three steps, which is the whole Gradio REST protocol: POST the inputs and get
+// an event id; read the SSE stream until `complete` carries the output file;
+// download that file. The Space emits PNG (we set `format="png"` on its Image
+// component for exactly this reason), so the bytes pass straight through — a
+// Worker has no image library to convert with.
+async function generateOnSovereignGpu(
+  env: Env,
+  opts: { prompt: string; width: number; height: number; seed?: number },
+): Promise<
+  | { ok: true; png: ArrayBuffer }
+  | { ok: false; waking: boolean; status: number; detail: string }
+> {
+  const headers = { "Authorization": `Bearer ${env.HF_TOKEN}`, "Content-Type": "application/json" };
+  const deadline = Date.now() + FLUX_ATTEMPT_MS;
+  const left = () => Math.max(1_000, deadline - Date.now());
+
+  try {
+    // infer(prompt, seed, randomize_seed, width, height, num_inference_steps)
+    const queued = await fetch(FLUX_INFER_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        data: [opts.prompt, opts.seed ?? 0, opts.seed === undefined, opts.width, opts.height, FLUX_STEPS],
+      }),
+      signal: AbortSignal.timeout(left()),
+    });
+    if (!queued.ok) {
+      const detail = (await queued.text().catch(() => "")).slice(0, 200);
+      // 429 is the rate limit that caused this whole redesign; 5xx is a nap.
+      return { ok: false, waking: queued.status >= 500, status: queued.status, detail };
+    }
+    const eventId = ((await queued.json()) as { event_id?: string }).event_id;
+    if (!eventId) return { ok: false, waking: false, status: 502, detail: "no event_id from the space" };
+
+    // A 200 here means *queued*, never *succeeded* — the result arrives on the
+    // stream, and a bad payload fails inside the app well after this point.
+    const stream = await fetch(`${FLUX_INFER_URL}/${eventId}`, {
+      headers: { "Authorization": `Bearer ${env.HF_TOKEN}` },
+      signal: AbortSignal.timeout(left()),
+    });
+    if (!stream.ok || !stream.body) {
+      return { ok: false, waking: stream.status >= 500, status: stream.status, detail: "stream not open" };
+    }
+
+    const fileUrl = await readGradioResult(stream.body, FLUX_SPACE_ID);
+    if (!fileUrl.ok) return { ok: false, waking: false, status: 502, detail: fileUrl.detail };
+
+    const file = await fetch(fileUrl.url, {
+      headers: { "Authorization": `Bearer ${env.HF_TOKEN}` },
+      signal: AbortSignal.timeout(left()),
+    });
+    if (!file.ok) return { ok: false, waking: false, status: file.status, detail: "result download failed" };
+    return { ok: true, png: await file.arrayBuffer() };
+  } catch (e) {
+    // Timed out, or the connection dropped. Treat as transient.
+    return { ok: false, waking: true, status: 504, detail: (e as Error).message };
+  }
+}
+
+// Read a Gradio SSE stream to its `complete` event and pull out the file URL.
+// `generating` and `heartbeat` events are chatter; `error` is the app itself
+// rejecting the call, which is a 502 for us and not worth retrying.
+async function readGradioResult(
+  body: ReadableStream<Uint8Array>,
+  spaceId: string,
+): Promise<{ ok: true; url: string } | { ok: false; detail: string }> {
+  const reader = body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  let event = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += value;
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (line.startsWith("event:")) { event = line.slice(6).trim(); continue; }
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (event === "error") return { ok: false, detail: `space error: ${payload.slice(0, 200)}` };
+        if (event !== "complete") continue;
+        const parsed = JSON.parse(payload) as Array<{ url?: string; path?: string }>;
+        const first = Array.isArray(parsed) ? parsed[0] : undefined;
+        if (!first) return { ok: false, detail: "complete event carried no file" };
+        const url = first.url
+          ?? (first.path ? `https://${spaceId.split("/")[1]}.hf.space/gradio_api/file=${first.path}` : undefined);
+        return url ? { ok: true, url } : { ok: false, detail: "no url or path in result" };
+      }
+    }
+    return { ok: false, detail: "stream ended before complete" };
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+}
+
+// ArrayBuffer → base64, chunked. A megabyte of PNG spread into
+// String.fromCharCode in one call overflows the argument limit.
+function toBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
 }
 
 // One generation call. Deliberately no retry loop.
