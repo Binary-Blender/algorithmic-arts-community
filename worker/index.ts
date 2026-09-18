@@ -46,6 +46,7 @@ const EXTERNAL_PREFIX = "/api/external";
 const PUBLISH_PREFIX  = "/api/publish";
 const FEED_PREFIX     = "/api/feed";
 const DREAM_PREFIX    = "/api/dream";
+const ANIMATE_PREFIX  = "/api/animate";
 
 // The dream machine — the imprint's free text-to-image generator. Anonymous,
 // bounded by deterministic daily caps instead of guardrail theater. The
@@ -92,6 +93,25 @@ const FLUX_SPACE_ID   = "novasynchris/flux-schnell";
 const FLUX_INFER_URL  = `https://novasynchris-flux-schnell.hf.space/gradio_api/call/infer`;
 const FLUX_STEPS      = 4;            // schnell is a 4-step model; more is waste
 const FLUX_ATTEMPT_MS = 35_000;       // queue + ~5s generation, with room
+
+// Image-to-video: Wan 2.2 I2V-A14B on our own ZeroGPU Space, called directly
+// from the edge for the same reason the images are (Space→Space gets a
+// persistent 429). The recipe — Lightx2v step-distillation LoRA, FP8
+// transformers, sm120 AoT kernels — makes a 5 s clip in ~32 s wall time
+// (measured 2026-09-18, cold and warm alike).
+//
+// Video is far dearer than a still. The Space runs `size="xlarge"`, the full
+// 96 GB card, which costs 2x quota per second; call it roughly a minute of the
+// 40-minute daily ZeroGPU pool per clip. That pool is shared with the Dream
+// Machine's images, so the caps below are set to fit beside them, not alone.
+const WAN_SPACE_ID         = "novasynchris/wan-i2v";
+const WAN_GENERATE_URL     = "https://novasynchris-wan-i2v.hf.space/gradio_api/call/generate_video";
+const WAN_STEPS            = 4;       // what the distillation LoRA is tuned for
+const WAN_SECONDS          = 5.0;     // 80 frames at 16 fps — the model's ceiling
+const WAN_ATTEMPT_MS       = 80_000;  // ~32 s measured, under Cloudflare's ~100 s
+const ANIMATE_IP_DAILY     = 3;
+const ANIMATE_GLOBAL_DAILY = 10;
+const ANIMATE_MAX_IMAGE    = 8_000_000;  // chars of data URL — the page downsizes first
 
 // Owned posts (POSSE origin) live in posts.json at the root of the content repo —
 // git-as-database, same shape as creators.json. The canonical URL of every post
@@ -152,7 +172,8 @@ export default {
     const isPublish  = url.pathname.startsWith(PUBLISH_PREFIX);
     const isFeed     = url.pathname.startsWith(FEED_PREFIX);
     const isDream    = url.pathname.startsWith(DREAM_PREFIX);
-    if (!isComments && !isLikes && !isRegister && !isLinks && !isExternal && !isPublish && !isFeed && !isDream) {
+    const isAnimate  = url.pathname.startsWith(ANIMATE_PREFIX);
+    if (!isComments && !isLikes && !isRegister && !isLinks && !isExternal && !isPublish && !isFeed && !isDream && !isAnimate) {
       return new Response("not found", { status: 404 });
     }
 
@@ -229,6 +250,13 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
     if (request.method === "POST" && suffix === "") return dreamImage(request, env);
     if (request.method === "GET" && suffix === "/backends") return dreamBackends(env);
     return jsonError(404, `no route: ${request.method} /api/dream${suffix}`);
+  }
+
+  // ── /api/animate ────────────────────────────────────────────────
+  if (url.pathname.startsWith(ANIMATE_PREFIX)) {
+    const suffix = url.pathname.slice(ANIMATE_PREFIX.length);
+    if (request.method === "POST" && suffix === "") return animateImage(request, env);
+    return jsonError(404, `no route: ${request.method} /api/animate${suffix}`);
   }
   return jsonError(404, `no route: ${request.method} ${url.pathname}`);
 }
@@ -1508,6 +1536,132 @@ function isDreamAdmin(request: Request, env: Env): boolean {
   return diff === 0;
 }
 
+// ─── Animate: image in, five seconds of video out ───────────────────
+//
+// Same posture as dreamImage: anonymous, capped not moderated, stores nothing.
+// The browser sends the starting frame as a data URL — a dream off the wall or
+// an upload, downsized client-side — and gets an MP4 back. Keeping the video
+// is the page's job, committed to the visitor's own repo with their own token.
+async function animateImage(request: Request, env: Env): Promise<Response> {
+  const payload = await parseJson(request);
+  if (!payload) return jsonError(400, "invalid JSON body");
+  const { image, prompt, seed } = payload as { image?: string; prompt?: string; seed?: number };
+
+  if (typeof image !== "string" || !/^data:image\/(png|jpeg|webp);base64,/.test(image)) {
+    return jsonError(400, "image must be a PNG, JPEG or WebP data URL");
+  }
+  if (image.length > ANIMATE_MAX_IMAGE) return jsonError(413, "image too large — the page should downsize it first");
+  const motion = typeof prompt === "string" && prompt.trim() ? prompt.trim() : "";
+  if (!motion) return jsonError(400, "missing prompt — describe the motion you want");
+  if (motion.length > 2000) return jsonError(413, "prompt too long (max 2000)");
+  const pickedSeed = typeof seed === "number" && Number.isFinite(seed) && seed >= 0 ? Math.floor(seed) : undefined;
+
+  // Separate, tighter counters than the stills: a clip costs roughly what a
+  // dozen images do. The house key lifts them the same way it lifts dreams.
+  const day = new Date().toISOString().slice(0, 10);
+  const admin = isDreamAdmin(request, env);
+  const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  const ipKey = `vip:${ip}:${day}`;
+  const globalKey = `vglobal:${day}`;
+  const [ipCount, globalCount, adminCount] = await Promise.all([
+    env.AA_DREAMS.get(ipKey).then((v) => Number(v ?? 0)),
+    env.AA_DREAMS.get(globalKey).then((v) => Number(v ?? 0)),
+    admin ? env.AA_DREAMS.get(`vadmin:${day}`).then((v) => Number(v ?? 0)) : Promise.resolve(0),
+  ]);
+  if (!admin) {
+    if (globalCount >= ANIMATE_GLOBAL_DAILY) {
+      return jsonError(429, "the projector has run its reels for today — come back tomorrow");
+    }
+    if (ipCount >= ANIMATE_IP_DAILY) {
+      return jsonError(429, `you've animated ${ANIMATE_IP_DAILY} today — come back tomorrow`);
+    }
+  }
+
+  const made = await generateVideoOnWan(env, { image, prompt: motion, ...(pickedSeed !== undefined ? { seed: pickedSeed } : {}) });
+  if (!made.ok) {
+    if (made.waking) {
+      await kickSpaceAwake(env, WAN_SPACE_ID);
+      return jsonError(503, "our babies are still waking up from their nap — give them a minute and try again", { waking: true });
+    }
+    return jsonError(made.status, `upstream ${made.status}: ${made.detail}`);
+  }
+
+  await Promise.all(admin
+    ? [env.AA_DREAMS.put(`vadmin:${day}`, String(adminCount + 1), { expirationTtl: 90000 })]
+    : [
+      env.AA_DREAMS.put(ipKey, String(ipCount + 1), { expirationTtl: 90000 }),
+      env.AA_DREAMS.put(globalKey, String(globalCount + 1), { expirationTtl: 90000 }),
+    ]);
+
+  return jsonOk({
+    video: {
+      id: `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
+      prompt: motion,
+      seconds: WAN_SECONDS,
+      seed: made.seed,
+      createdAt: new Date().toISOString(),
+      backend: "sovereign",
+    },
+    b64_mp4: made.mp4,
+    ...(admin ? { admin: true, adminToday: adminCount + 1 } : {}),
+    remaining: admin
+      ? { you: null, today: null }
+      : { you: ANIMATE_IP_DAILY - ipCount - 1, today: ANIMATE_GLOBAL_DAILY - globalCount - 1 },
+  });
+}
+
+// One call to the Wan Space. The same three-step Gradio protocol as FLUX, but
+// the result arrives inline: the complete payload is {video: "data:video/mp4;
+// base64,…", seed}, so there is no file to fetch afterwards.
+async function generateVideoOnWan(
+  env: Env,
+  opts: { image: string; prompt: string; seed?: number },
+): Promise<
+  | { ok: true; mp4: string; seed: number | undefined }
+  | { ok: false; waking: boolean; status: number; detail: string }
+> {
+  const deadline = Date.now() + WAN_ATTEMPT_MS;
+  const left = () => Math.max(1_000, deadline - Date.now());
+  const auth = { "Authorization": `Bearer ${env.HF_TOKEN}` };
+  try {
+    // generate_video(image_b64, prompt, steps, negative_prompt, duration_seconds,
+    //                guidance_scale, guidance_scale_2, seed, randomize_seed)
+    // Guidance stays at 1.0: the Lightx2v LoRA distils classifier-free guidance
+    // away, so a negative prompt would have nothing to push against.
+    const queued = await fetch(WAN_GENERATE_URL, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({ data: [
+        opts.image, opts.prompt, WAN_STEPS, "", WAN_SECONDS, 1.0, 1.0,
+        opts.seed ?? 0, opts.seed === undefined,
+      ] }),
+      signal: AbortSignal.timeout(left()),
+    });
+    if (!queued.ok) {
+      const detail = (await queued.text().catch(() => "")).slice(0, 200);
+      return { ok: false, waking: queued.status >= 500, status: queued.status, detail };
+    }
+    const eventId = ((await queued.json()) as { event_id?: string }).event_id;
+    if (!eventId) return { ok: false, waking: false, status: 502, detail: "no event_id from the space" };
+
+    const stream = await fetch(`${WAN_GENERATE_URL}/${eventId}`, { headers: auth, signal: AbortSignal.timeout(left()) });
+    if (!stream.ok || !stream.body) {
+      return { ok: false, waking: stream.status >= 500, status: stream.status, detail: "stream not open" };
+    }
+    const done = await readGradioComplete(stream.body);
+    if (!done.ok) return { ok: false, waking: false, status: 502, detail: done.detail };
+
+    const out = done.data[0] as { video?: string; seed?: number } | undefined;
+    const video = out?.video;
+    if (typeof video !== "string" || !video.startsWith("data:video/mp4;base64,")) {
+      return { ok: false, waking: false, status: 502, detail: "space returned no mp4" };
+    }
+    return { ok: true, mp4: video.slice("data:video/mp4;base64,".length), seed: out?.seed };
+  } catch (e) {
+    return { ok: false, waking: true, status: 504, detail: (e as Error).message };
+  }
+}
+
 // Which backend served each dream, tallied by day.
 //
 // The sovereign ZeroGPU path is free and the provider fallback is metered, so a
@@ -1644,13 +1798,12 @@ async function generateOnSovereignGpu(
   }
 }
 
-// Read a Gradio SSE stream to its `complete` event and pull out the file URL.
+// Read a Gradio SSE stream to its `complete` event and return the payload.
 // `generating` and `heartbeat` events are chatter; `error` is the app itself
 // rejecting the call, which is a 502 for us and not worth retrying.
-async function readGradioResult(
+async function readGradioComplete(
   body: ReadableStream<Uint8Array>,
-  spaceId: string,
-): Promise<{ ok: true; url: string } | { ok: false; detail: string }> {
+): Promise<{ ok: true; data: unknown[] } | { ok: false; detail: string }> {
   const reader = body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
   let event = "";
@@ -1668,18 +1821,28 @@ async function readGradioResult(
         const payload = line.slice(5).trim();
         if (event === "error") return { ok: false, detail: `space error: ${payload.slice(0, 200)}` };
         if (event !== "complete") continue;
-        const parsed = JSON.parse(payload) as Array<{ url?: string; path?: string }>;
-        const first = Array.isArray(parsed) ? parsed[0] : undefined;
-        if (!first) return { ok: false, detail: "complete event carried no file" };
-        const url = first.url
-          ?? (first.path ? `https://${spaceId.split("/")[1]}.hf.space/gradio_api/file=${first.path}` : undefined);
-        return url ? { ok: true, url } : { ok: false, detail: "no url or path in result" };
+        const parsed = JSON.parse(payload) as unknown;
+        return Array.isArray(parsed) ? { ok: true, data: parsed } : { ok: false, detail: "complete event was not a list" };
       }
     }
     return { ok: false, detail: "stream ended before complete" };
   } finally {
     await reader.cancel().catch(() => {});
   }
+}
+
+// FLUX's output is a file: pull its URL out of the complete payload.
+async function readGradioResult(
+  body: ReadableStream<Uint8Array>,
+  spaceId: string,
+): Promise<{ ok: true; url: string } | { ok: false; detail: string }> {
+  const done = await readGradioComplete(body);
+  if (!done.ok) return done;
+  const first = done.data[0] as { url?: string; path?: string } | undefined;
+  if (!first) return { ok: false, detail: "complete event carried no file" };
+  const url = first.url
+    ?? (first.path ? `https://${spaceId.split("/")[1]}.hf.space/gradio_api/file=${first.path}` : undefined);
+  return url ? { ok: true, url } : { ok: false, detail: "no url or path in result" };
 }
 
 // ArrayBuffer → base64, chunked. A megabyte of PNG spread into
